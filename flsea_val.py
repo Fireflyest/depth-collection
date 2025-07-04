@@ -165,7 +165,7 @@ def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disp
         'spearman_corr': spearman_corr
     }
 
-def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth, proc_pred_depth, file_prefix, output_dir, pred_is_disparity=False):
+def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth, proc_pred_depth, file_prefix, output_dir, pred_is_disparity=False, outputs_metric_depth=False):
     """
     Create a combined visualization comparing original and processed images with their depth predictions
     
@@ -177,6 +177,7 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
         proc_pred_depth: Predicted depth map from processed image
         file_prefix: Prefix for saved files
         output_dir: Directory to save visualizations
+        pred_is_disparity: Whether predictions are disparity maps or relative depth
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -206,19 +207,39 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     if gt_valid_depths:
         gt_valid_values = np.concatenate(gt_valid_depths)
         gt_min_depth, gt_max_depth = np.percentile(gt_valid_values, [2, 98])
-        gt_range_text = f"Range: {gt_min_depth:.2f} - {gt_max_depth:.2f}"
+        gt_range_text = f"GT Depth: {gt_min_depth:.2f} - {gt_max_depth:.2f} (meters)"
         
         # 为gt单独归一化
         if np.any(gt_valid):
             gt_viz[gt_valid] = np.clip((gt_depth[gt_valid] - gt_min_depth) / (gt_max_depth - gt_min_depth + 1e-8), 0, 1)
     else:
-        gt_range_text = "Range: N/A"
+        gt_range_text = "GT Depth: N/A"
     
     # 为预测深度确定范围
     if pred_valid_depths:
         pred_valid_values = np.concatenate(pred_valid_depths)
         pred_min_depth, pred_max_depth = np.percentile(pred_valid_values, [5, 95])
-        pred_range_text = f"Range: {pred_min_depth:.2f} - {pred_max_depth:.2f}"
+        
+        if pred_is_disparity:
+            # Case: outputs disparity (both ZoeDepth non-metric and DepthAnything)
+            # Convert disparity range to depth range for better understanding
+            pred_as_depth_max = 1.0 / (pred_min_depth + 1e-6)  # min disparity -> max depth
+            pred_as_depth_min = 1.0 / (pred_max_depth + 1e-6)  # max disparity -> min depth
+            
+            if outputs_metric_depth:
+                # This shouldn't happen, but handle it gracefully
+                pred_range_text = f"Pred Disparity: {pred_min_depth:.2f} - {pred_max_depth:.2f}\nAs Depth: {pred_as_depth_min:.2f} - {pred_as_depth_max:.2f} (meters)"
+            else:
+                # Both ZoeDepth (non-metric) and DepthAnything output disparity-like values
+                pred_range_text = f"Pred Disparity: {pred_min_depth:.2f} - {pred_max_depth:.2f}\nAs Depth: {pred_as_depth_min:.2f} - {pred_as_depth_max:.2f} (relative scale)"
+        else:
+            # Case: outputs depth (ZoeDepth metric mode)
+            if outputs_metric_depth:
+                # ZoeDepth case: outputs metric depth in meters
+                pred_range_text = f"Pred Depth: {pred_min_depth:.2f} - {pred_max_depth:.2f} (m)"
+            else:
+                # This shouldn't happen now, but handle it gracefully
+                pred_range_text = f"Pred Depth: {pred_min_depth:.2f} - {pred_max_depth:.2f} (relative scale)"
         
         # 归一化预测深度
         if np.any(orig_pred_valid):
@@ -226,42 +247,43 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
         if np.any(proc_pred_valid):
             proc_pred_viz[proc_pred_valid] = np.clip((proc_pred_depth[proc_pred_valid] - pred_min_depth) / (pred_max_depth - pred_min_depth + 1e-8), 0, 1)
     else:
-        pred_range_text = "Range: N/A"
+        pred_range_text = "Pred: N/A"
     
     # Apply colormap with custom handling for invalid values
     cm_jet = plt.colormaps['jet']  # Modern way to get colormap
     
-    # Ground truth (always disparity map, but FLSea uses reverse color convention)
-    # Original FLSea: near=blue, far=red. We want: near=red, far=blue
-    # So we need to invert the GT visualization
+    # Ground truth (depth map: small values=near, large values=far)
+    # For depth: near=small value=red, far=large value=blue
+    # Note: jet colormap goes from blue(0) to red(1), so we need to INVERT for depth
     gt_colored = np.zeros((*gt_viz.shape, 4), dtype=np.float32)
-    gt_colored[gt_valid] = cm_jet(1.0 - gt_viz[gt_valid])  # Invert to match our color convention (high=near=red)
+    gt_colored[gt_valid] = cm_jet(1.0 - gt_viz[gt_valid])  # Invert mapping for depth (low depth=near=red, high depth=far=blue)
     gt_colored[~gt_valid, 3] = 0  # Set alpha=0 for invalid regions
     gt_rgb = gt_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
     # Prediction visualization depends on whether prediction is disparity or relative depth
     if pred_is_disparity:
-        # ZoeDepth case: prediction is disparity, use same INVERTED mapping as GT
+        # ZoeDepth case: prediction is disparity, use DIRECT mapping since disparity is already inverted relative to depth
+        # Disparity: high=near, low=far, and jet(high)=red, jet(low)=blue, so direct mapping gives near=red
         orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
-        orig_pred_colored[orig_pred_valid] = cm_jet(1.0 - orig_pred_viz[orig_pred_valid])  # Invert to match GT convention
+        orig_pred_colored[orig_pred_valid] = cm_jet(orig_pred_viz[orig_pred_valid])  # Direct mapping for disparity
         orig_pred_colored[~orig_pred_valid, 3] = 0
         orig_pred_rgb = orig_pred_colored[:, :, :3]
         
         proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
-        proc_pred_colored[proc_pred_valid] = cm_jet(1.0 - proc_pred_viz[proc_pred_valid])  # Invert to match GT convention
+        proc_pred_colored[proc_pred_valid] = cm_jet(proc_pred_viz[proc_pred_valid])  # Direct mapping for disparity
         proc_pred_colored[~proc_pred_valid, 3] = 0
         proc_pred_rgb = proc_pred_colored[:, :, :3]
         
-        pred_title_suffix = "Disparity Prediction (Near=Red, Far=Blue)"
+        pred_title_suffix = "Disparity→Depth View (Near=Red, Far=Blue)"
     else:
-        # DepthAnything case: prediction is relative depth, use direct mapping (low=near=red, high=far=blue)
+        # DepthAnything case: prediction is relative depth, use INVERTED mapping (same as GT)
         orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
-        orig_pred_colored[orig_pred_valid] = cm_jet(orig_pred_viz[orig_pred_valid])  # Direct mapping for depth
+        orig_pred_colored[orig_pred_valid] = cm_jet(1.0 - orig_pred_viz[orig_pred_valid])  # Invert mapping for depth
         orig_pred_colored[~orig_pred_valid, 3] = 0
         orig_pred_rgb = orig_pred_colored[:, :, :3]
         
         proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
-        proc_pred_colored[proc_pred_valid] = cm_jet(proc_pred_viz[proc_pred_valid])  # Direct mapping for depth
+        proc_pred_colored[proc_pred_valid] = cm_jet(1.0 - proc_pred_viz[proc_pred_valid])  # Invert mapping for depth
         proc_pred_colored[~proc_pred_valid, 3] = 0
         proc_pred_rgb = proc_pred_colored[:, :, :3]
         
@@ -285,18 +307,96 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     
     plt.subplot(2, 3, 3)
     plt.imshow(gt_rgb)
-    plt.title('Ground Truth Disparity (Near=Red, Far=Blue)')
+    plt.title(f'Ground Truth Depth (Near=Red, Far=Blue)\n{gt_range_text}')
+    
+    # Add depth scale markers for GT (now confirmed as depth values)
+    if gt_valid_depths:
+        h, w = gt_depth.shape
+        x_center = w // 2
+        y_positions = [h // 6, h // 2, 5 * h // 6]  # top, middle, bottom
+        
+        for y_pos in y_positions:
+            if gt_valid[y_pos, x_center]:
+                depth_val = gt_depth[y_pos, x_center]
+                plt.annotate(f'{depth_val:.2f}m', 
+                           xy=(x_center, y_pos), 
+                           xytext=(x_center + w//8, y_pos),
+                           fontsize=8, color='white', weight='bold',
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8),
+                           arrowprops=dict(arrowstyle='->', color='white', lw=1))
+    
     plt.axis('off')
     
     # Second row: Depth predictions and error maps
     plt.subplot(2, 3, 4)
     plt.imshow(orig_pred_rgb)
-    plt.title(f'Original Image {pred_title_suffix}')
+    plt.title(f'Original Image {pred_title_suffix}\n{pred_range_text}')
+    
+    # Add depth scale markers for predictions
+    if pred_valid_depths:
+        h, w = orig_pred_depth.shape
+        x_center = w // 2
+        y_positions = [h // 6, h // 2, 5 * h // 6]
+        
+        for y_pos in y_positions:
+            if orig_pred_valid[y_pos, x_center]:
+                pred_val = orig_pred_depth[y_pos, x_center]
+                
+                if pred_is_disparity:
+                    # Prediction is disparity, convert to depth
+                    depth_meters = 1.0 / (pred_val + 1e-6)
+                    label = f'{depth_meters:.2f}m'
+                else:
+                    # Prediction is depth
+                    if outputs_metric_depth:
+                        # ZoeDepth metric case: show depth in meters
+                        label = f'{pred_val:.2f}m'
+                    else:
+                        # Relative depth case: show relative value
+                        label = f'rel:{pred_val:.2f}'
+                
+                plt.annotate(label, 
+                           xy=(x_center, y_pos), 
+                           xytext=(x_center + w//10, y_pos),
+                           fontsize=8, color='white', weight='bold',
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7),
+                           arrowprops=dict(arrowstyle='->', color='white', lw=1))
+    
     plt.axis('off')
     
     plt.subplot(2, 3, 5)
     plt.imshow(proc_pred_rgb)
-    plt.title(f'Processed Image {pred_title_suffix}')
+    plt.title(f'Processed Image {pred_title_suffix}\n{pred_range_text}')
+    
+    # Add depth scale markers for processed predictions (same logic as original)
+    if pred_valid_depths:
+        h, w = proc_pred_depth.shape
+        x_center = w // 2
+        y_positions = [h // 6, h // 2, 5 * h // 6]
+        
+        for y_pos in y_positions:
+            if proc_pred_valid[y_pos, x_center]:
+                pred_val = proc_pred_depth[y_pos, x_center]
+                
+                if pred_is_disparity:
+                    depth_meters = 1.0 / (pred_val + 1e-6)
+                    label = f'{depth_meters:.2f}m'
+                else:
+                    # Prediction is depth
+                    if outputs_metric_depth:
+                        # ZoeDepth metric case: show depth in meters
+                        label = f'{pred_val:.2f}m'
+                    else:
+                        # Relative depth case: show relative value
+                        label = f'rel:{pred_val:.2f}'
+                
+                plt.annotate(label, 
+                           xy=(x_center, y_pos), 
+                           xytext=(x_center + w//10, y_pos),
+                           fontsize=8, color='white', weight='bold',
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7),
+                           arrowprops=dict(arrowstyle='->', color='white', lw=1))
+    
     plt.axis('off')
     
     # Compute error maps
@@ -424,9 +524,8 @@ class ModelWrapper:
         self._patch_zoedepth_model()
         
         self.model = self.model.to(self.device).eval()
-        # Based on visualization evidence, ZoeDepth appears to output disparity (near=blue, far=red)
-        # rather than metric depth as originally assumed
-        self.outputs_metric_depth = False  # ZoeDepth outputs disparity, not metric depth
+        # ZoeDepth outputs metric depth in meters, same as GT
+        self.outputs_metric_depth = True  # ZoeDepth outputs metric depth
         
     def _patch_zoedepth_model(self):
         """Apply compatibility patches for ZoeDepth"""
@@ -490,20 +589,21 @@ class ModelWrapper:
             processed_depth = pred_depth  # Keep as metric depth
             display_depth = pred_depth.copy()  # Keep as metric depth for consistent visualization
             
-            # For metrics calculation: pred is depth, gt is disparity
+            # For metrics calculation: pred is depth (same as GT)
             is_pred_disparity = False  # Pred is metric depth, not disparity
         else:
-            # Non-metric models: distinguish between DepthAnything (relative depth) and ZoeDepth (disparity)
+            # Non-metric models: both DepthAnything and ZoeDepth output disparity-like values
             if self.model_type == 'zoedepth':
-                # ZoeDepth: based on visualization evidence, outputs disparity
+                # ZoeDepth: when not metric, outputs disparity
                 processed_depth = pred_depth  # Keep as disparity
                 display_depth = pred_depth.copy()  # Keep as disparity for visualization
-                is_pred_disparity = True  # Pred is disparity (same as GT)
+                is_pred_disparity = True  # Pred is disparity
             else:
-                # DepthAnything: outputs relative depth, not disparity
-                processed_depth = pred_depth  # Keep as relative depth
-                display_depth = pred_depth.copy()  # Keep as relative depth for visualization
-                is_pred_disparity = False  # Pred is relative depth, will be converted to depth in metrics
+                # DepthAnything: based on visualization evidence, also outputs disparity-like values
+                # (far regions have small values, near regions have large values)
+                processed_depth = pred_depth  # Keep as disparity-like values
+                display_depth = pred_depth.copy()  # Keep as disparity-like values for visualization
+                is_pred_disparity = True  # Pred is disparity-like
         
         return processed_depth, display_depth, is_pred_disparity
 
@@ -611,19 +711,18 @@ def validate_flsea(args):
             visualize_comparison_combined(
                 original_image, processed_image, gt_depth, 
                 orig_pred_display, proc_pred_display,
-                basename, args.output_dir, pred_is_disparity=is_pred_disparity
+                basename, args.output_dir, pred_is_disparity=is_pred_disparity,
+                outputs_metric_depth=model.outputs_metric_depth
             )
             
-            # Compute metrics: Follow original script logic
-            # ZoeDepth: treat output as metric depth, GT as disparity  
-            # DepthAnything: treat output as relative depth, GT as disparity
+            # Compute metrics: GT is now confirmed as depth, not disparity
             metrics_orig_sample = compute_depth_metrics(
                 orig_pred_processed, gt_depth, 
-                is_gt_disparity=True, is_pred_disparity=is_pred_disparity
+                is_gt_disparity=False, is_pred_disparity=is_pred_disparity
             )
             metrics_proc_sample = compute_depth_metrics(
                 proc_pred_processed, gt_depth, 
-                is_gt_disparity=True, is_pred_disparity=is_pred_disparity
+                is_gt_disparity=False, is_pred_disparity=is_pred_disparity
             )
             
             # Add to totals for metrics calculation
@@ -651,51 +750,48 @@ def validate_flsea(args):
         print(f"\nModel: {model_name}")
         print(f"Outputs metric depth: {model.outputs_metric_depth}")
         
-        # Print metrics for original images
-        print("\nOriginal Images - Average Metrics:")
-        print(f"Scale Factor: {avg_metrics_orig['scale_factor']:.4f}")
-        print(f"RMSE: {avg_metrics_orig['rmse']:.4f}")
-        print(f"RMSE-log: {avg_metrics_orig['rmse_log']:.4f}")
-        print(f"Abs Rel: {avg_metrics_orig['abs_rel']:.4f}")
-        print(f"Sq Rel: {avg_metrics_orig['sq_rel']:.4f}")
-        print(f"Delta < 1.25: {avg_metrics_orig['delta1']:.4f}")
-        print(f"Delta < 1.25^2: {avg_metrics_orig['delta2']:.4f}")
-        print(f"Delta < 1.25^3: {avg_metrics_orig['delta3']:.4f}")
-        print(f"Log10: {avg_metrics_orig['log10']:.4f}")
-        print(f"SILog: {avg_metrics_orig['silog']:.4f}")
-        print(f"Pearson Corr: {avg_metrics_orig['pearson_corr']:.4f}")
-        print(f"Spearman Corr: {avg_metrics_orig['spearman_corr']:.4f}")
+        # Print metrics in table format
+        print("\n" + "="*90)
+        print(f"{'Metric':<15} {'Original':<15} {'SeaErra':<15} {'Improvement':<20} {'Status':<10}")
+        print("="*90)
         
-        # Print metrics for processed images
-        print("\nProcessed Images (SeaErra) - Average Metrics:")
-        print(f"Scale Factor: {avg_metrics_proc['scale_factor']:.4f}")
-        print(f"RMSE: {avg_metrics_proc['rmse']:.4f}")
-        print(f"RMSE-log: {avg_metrics_proc['rmse_log']:.4f}")
-        print(f"Abs Rel: {avg_metrics_proc['abs_rel']:.4f}")
-        print(f"Sq Rel: {avg_metrics_proc['sq_rel']:.4f}")
-        print(f"Delta < 1.25: {avg_metrics_proc['delta1']:.4f}")
-        print(f"Delta < 1.25^2: {avg_metrics_proc['delta2']:.4f}")
-        print(f"Delta < 1.25^3: {avg_metrics_proc['delta3']:.4f}")
-        print(f"Log10: {avg_metrics_proc['log10']:.4f}")
-        print(f"SILog: {avg_metrics_proc['silog']:.4f}")
-        print(f"Pearson Corr: {avg_metrics_proc['pearson_corr']:.4f}")
-        print(f"Spearman Corr: {avg_metrics_proc['spearman_corr']:.4f}")
+        # Define metric names and whether higher is better
+        metric_info = [
+            ('Scale Factor', 'scale_factor', 'neutral'),
+            ('RMSE', 'rmse', 'lower_better'),
+            ('RMSE-log', 'rmse_log', 'lower_better'),
+            ('Abs Rel', 'abs_rel', 'lower_better'),
+            ('Sq Rel', 'sq_rel', 'lower_better'),
+            ('Delta < 1.25', 'delta1', 'higher_better'),
+            ('Delta < 1.25^2', 'delta2', 'higher_better'),
+            ('Delta < 1.25^3', 'delta3', 'higher_better'),
+            ('Log10', 'log10', 'lower_better'),
+            ('SILog', 'silog', 'lower_better'),
+            ('Pearson Corr', 'pearson_corr', 'higher_better'),
+            ('Spearman Corr', 'spearman_corr', 'higher_better'),
+        ]
         
-        # Print comparison
-        print("\nMetric Improvement (SeaErra vs Original):")
-        for k in metrics_orig.keys():
-            improvement = avg_metrics_proc[k] - avg_metrics_orig[k]
-            if k in ['delta1', 'delta2', 'delta3', 'pearson_corr', 'spearman_corr']:
-                # For these metrics, higher is better
-                better = improvement > 0
-                print(f"{k}: {improvement:+.4f} ({'better' if better else 'worse'})")
-            elif k == 'scale_factor':
-                # Scale factor is just a scaling coefficient, not a quality metric
-                print(f"{k}: {improvement:+.4f}")
+        for display_name, key, criterion in metric_info:
+            orig_val = avg_metrics_orig[key]
+            proc_val = avg_metrics_proc[key]
+            improvement = proc_val - orig_val
+            
+            # Determine status
+            if criterion == 'neutral':
+                status = ""
+            elif criterion == 'higher_better':
+                status = "Better" if improvement > 0 else ("Worse" if improvement < 0 else "Same")
+            elif criterion == 'lower_better':
+                status = "Better" if improvement < 0 else ("Worse" if improvement > 0 else "Same")
             else:
-                # For error metrics, lower is better
-                better = improvement < 0
-                print(f"{k}: {improvement:+.4f} ({'better' if better else 'worse'})")
+                status = ""
+            
+            # Format improvement with appropriate sign
+            improvement_str = f"{improvement:+.4f}"
+            
+            print(f"{display_name:<15} {orig_val:<15.4f} {proc_val:<15.4f} {improvement_str:<20} {status:<10}")
+        
+        print("="*90)
         
         # Save overall metrics to a JSON file
         serializable_metrics = {
