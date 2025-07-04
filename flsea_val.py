@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-FLSea Dataset Validation Script for Depth-Anything-V2
+Unified FLSea Dataset Validation Script
 Evaluates model performance on both original and processed underwater images from the FLSea dataset
-
-Note: The ground truth in FLSea dataset is actually a disparity map (inverse depth),
-so color representation is reversed (near=blue, far=red) compared to typical depth maps.
+Supports multiple depth estimation models: DepthAnything v2 and ZoeDepth
 
 Usage:
-    python flsea_val.py --encoder vitl --data-root assets/FLSea/red_sea/pier_path --num-samples 10
+    # For DepthAnything v2
+    python flsea_val.py --model-type depthanything --encoder vitl --data-root assets/FLSea/red_sea/pier_path --num-samples 10
+    
+    # For ZoeDepth
+    python flsea_val.py --model-type zoedepth --zoedepth-type N --data-root assets/FLSea/red_sea/pier_path --num-samples 10
 """
 
 import os
@@ -24,14 +26,17 @@ import random
 import warnings
 from skimage.transform import resize
 
-# Import Depth-Anything-V2 model
+# Import models
 from depth_anything_v2.dpt import DepthAnythingV2
+from zoedepth.models.builder import build_model
+from zoedepth.utils.config import get_config
 
 # Import FLSea dataset
 from flsea_dataset import FLSeaDataset
 
 # Suppress warnings
 warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 def align_depth_scale(pred, gt, method='median'):
     """
@@ -59,16 +64,17 @@ def align_depth_scale(pred, gt, method='median'):
     
     return scale, pred * scale
 
-def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disparity=True):
+def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disparity=True, is_pred_disparity=False):
     """
     Compute depth evaluation metrics for relative depth estimation
     
     Args:
-        pred: predicted depth map (relative depth)
+        pred: predicted depth/disparity map
         gt: ground truth map (disparity or depth)
         mask: optional mask for valid pixels
         align_method: method for scale alignment ('median', 'mean', 'least_squares')
         is_gt_disparity: whether the ground truth is a disparity map (inverse depth)
+        is_pred_disparity: whether the prediction is a disparity map (inverse depth)
         
     Returns:
         Dictionary of metrics
@@ -100,14 +106,18 @@ def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disp
     pred = pred[valid_mask]
     gt = gt[valid_mask].copy()  # Make a copy to avoid modifying the original
     
-    # If ground truth is disparity, convert to depth by taking reciprocal
-    if is_gt_disparity:
-        # Avoid division by zero
-        eps = 1e-6
-        gt = 1.0 / (gt + eps)
-    
-    # Add a small epsilon to prevent division by zero
+    # Avoid division by zero
     eps = 1e-6
+    
+    # Convert to same domain for fair comparison
+    # Strategy: Convert everything to depth domain for metrics calculation
+    if is_gt_disparity:
+        gt = 1.0 / (gt + eps)  # GT: disparity → depth
+    
+    if is_pred_disparity:
+        pred = 1.0 / (pred + eps)  # Pred: disparity → depth
+    
+    # Now both pred and gt are in depth domain (near=small, far=large)
     
     # Align scale - critical for comparing relative depth with metric depth
     scale_factor, pred_aligned = align_depth_scale(pred, gt, method=align_method)
@@ -131,11 +141,11 @@ def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disp
     log_diff = np.log(pred_aligned + eps) - np.log(gt + eps)
     silog = np.sqrt(np.mean(log_diff ** 2) - (np.mean(log_diff) ** 2)) * 100
     
-    # Correlation metrics (scale-invariant)
+    # Correlation metrics (should use aligned values for fair comparison)
     from scipy.stats import pearsonr, spearmanr
     try:
-        pearson_corr, _ = pearsonr(pred.flatten(), gt.flatten())
-        spearman_corr, _ = spearmanr(pred.flatten(), gt.flatten())
+        pearson_corr, _ = pearsonr(pred_aligned.flatten(), gt.flatten())
+        spearman_corr, _ = spearmanr(pred_aligned.flatten(), gt.flatten())
     except:
         pearson_corr = 0
         spearman_corr = 0
@@ -155,7 +165,7 @@ def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disp
         'spearman_corr': spearman_corr
     }
 
-def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth, proc_pred_depth, file_prefix, output_dir):
+def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth, proc_pred_depth, file_prefix, output_dir, pred_is_disparity=False):
     """
     Create a combined visualization comparing original and processed images with their depth predictions
     
@@ -182,7 +192,6 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     proc_pred_valid = ~np.isnan(proc_pred_depth) & ~np.isinf(proc_pred_depth) & (proc_pred_depth > 0)
     
     # Create a combined mask of valid pixels across all depth maps for consistent normalization
-    all_valid_depths = []
     gt_valid_depths = []
     pred_valid_depths = []
     
@@ -197,43 +206,66 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     if gt_valid_depths:
         gt_valid_values = np.concatenate(gt_valid_depths)
         gt_min_depth, gt_max_depth = np.percentile(gt_valid_values, [2, 98])
-        print(f"Ground truth depth range: {gt_min_depth:.2f} - {gt_max_depth:.2f}")
+        gt_range_text = f"Range: {gt_min_depth:.2f} - {gt_max_depth:.2f}"
         
         # 为gt单独归一化
         if np.any(gt_valid):
             gt_viz[gt_valid] = np.clip((gt_depth[gt_valid] - gt_min_depth) / (gt_max_depth - gt_min_depth + 1e-8), 0, 1)
+    else:
+        gt_range_text = "Range: N/A"
     
     # 为预测深度确定范围
     if pred_valid_depths:
         pred_valid_values = np.concatenate(pred_valid_depths)
         pred_min_depth, pred_max_depth = np.percentile(pred_valid_values, [5, 95])
-        print(f"Predicted depth range: {pred_min_depth:.2f} - {pred_max_depth:.2f}")
+        pred_range_text = f"Range: {pred_min_depth:.2f} - {pred_max_depth:.2f}"
         
         # 归一化预测深度
         if np.any(orig_pred_valid):
             orig_pred_viz[orig_pred_valid] = np.clip((orig_pred_depth[orig_pred_valid] - pred_min_depth) / (pred_max_depth - pred_min_depth + 1e-8), 0, 1)
         if np.any(proc_pred_valid):
             proc_pred_viz[proc_pred_valid] = np.clip((proc_pred_depth[proc_pred_valid] - pred_min_depth) / (pred_max_depth - pred_min_depth + 1e-8), 0, 1)
+    else:
+        pred_range_text = "Range: N/A"
     
     # Apply colormap with custom handling for invalid values
     cm_jet = plt.colormaps['jet']  # Modern way to get colormap
     
-    # For depth maps: near=red (1.0), far=blue (0.0), invalid=black
-    # Ground truth (disparity map, so we invert colors to make near=red, far=blue)
+    # Ground truth (always disparity map, but FLSea uses reverse color convention)
+    # Original FLSea: near=blue, far=red. We want: near=red, far=blue
+    # So we need to invert the GT visualization
     gt_colored = np.zeros((*gt_viz.shape, 4), dtype=np.float32)
-    gt_colored[gt_valid] = cm_jet(1.0 - gt_viz[gt_valid])  # Invert disparity map colors (near=red, far=blue)
+    gt_colored[gt_valid] = cm_jet(1.0 - gt_viz[gt_valid])  # Invert to match our color convention (high=near=red)
     gt_colored[~gt_valid, 3] = 0  # Set alpha=0 for invalid regions
     gt_rgb = gt_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
-    # Original prediction (depth map, so we don't invert colors to keep near=red, far=blue)
-    orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
-    orig_pred_colored[orig_pred_valid] = cm_jet(orig_pred_viz[orig_pred_valid])  # Direct mapping for depth (near=red, far=blue)
-    orig_pred_colored[~orig_pred_valid, 3] = 0
-    orig_pred_rgb = orig_pred_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
-    
-    # Processed prediction
-    proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
-    proc_pred_colored[proc_pred_valid] = cm_jet(proc_pred_viz[proc_pred_valid])  # Direct mapping for depth (near=red, far=blue)
+    # Prediction visualization depends on whether prediction is disparity or relative depth
+    if pred_is_disparity:
+        # ZoeDepth case: prediction is disparity, use same INVERTED mapping as GT
+        orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
+        orig_pred_colored[orig_pred_valid] = cm_jet(1.0 - orig_pred_viz[orig_pred_valid])  # Invert to match GT convention
+        orig_pred_colored[~orig_pred_valid, 3] = 0
+        orig_pred_rgb = orig_pred_colored[:, :, :3]
+        
+        proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
+        proc_pred_colored[proc_pred_valid] = cm_jet(1.0 - proc_pred_viz[proc_pred_valid])  # Invert to match GT convention
+        proc_pred_colored[~proc_pred_valid, 3] = 0
+        proc_pred_rgb = proc_pred_colored[:, :, :3]
+        
+        pred_title_suffix = "Disparity Prediction (Near=Red, Far=Blue)"
+    else:
+        # DepthAnything case: prediction is relative depth, use direct mapping (low=near=red, high=far=blue)
+        orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
+        orig_pred_colored[orig_pred_valid] = cm_jet(orig_pred_viz[orig_pred_valid])  # Direct mapping for depth
+        orig_pred_colored[~orig_pred_valid, 3] = 0
+        orig_pred_rgb = orig_pred_colored[:, :, :3]
+        
+        proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
+        proc_pred_colored[proc_pred_valid] = cm_jet(proc_pred_viz[proc_pred_valid])  # Direct mapping for depth
+        proc_pred_colored[~proc_pred_valid, 3] = 0
+        proc_pred_rgb = proc_pred_colored[:, :, :3]
+        
+        pred_title_suffix = "Depth Prediction (Near=Red, Far=Blue)"
     proc_pred_colored[~proc_pred_valid, 3] = 0
     proc_pred_rgb = proc_pred_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
@@ -259,28 +291,35 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     # Second row: Depth predictions and error maps
     plt.subplot(2, 3, 4)
     plt.imshow(orig_pred_rgb)
-    plt.title('Original Image Depth Prediction (Near=Red, Far=Blue)')
+    plt.title(f'Original Image {pred_title_suffix}')
     plt.axis('off')
     
     plt.subplot(2, 3, 5)
     plt.imshow(proc_pred_rgb)
-    plt.title('Processed Image Depth Prediction (Near=Red, Far=Blue)')
+    plt.title(f'Processed Image {pred_title_suffix}')
     plt.axis('off')
     
     # Compute error maps
     plt.subplot(2, 3, 6)
     
     # Compute error for both original and processed predictions
-    # Since we now use consistent color mapping for all depth maps (near=red, far=blue)
     orig_error = np.zeros_like(gt_depth)
     proc_error = np.zeros_like(gt_depth)
     valid_orig = gt_valid & orig_pred_valid
     valid_proc = gt_valid & proc_pred_valid
     
-    if np.any(valid_orig):
-        orig_error[valid_orig] = np.abs((1.0 - gt_viz[valid_orig]) - orig_pred_viz[valid_orig])
-    if np.any(valid_proc):
-        proc_error[valid_proc] = np.abs((1.0 - gt_viz[valid_proc]) - proc_pred_viz[valid_proc])
+    if pred_is_disparity:
+        # Both GT and predictions use inverted mapping, so compute error directly
+        if np.any(valid_orig):
+            orig_error[valid_orig] = np.abs((1.0 - gt_viz[valid_orig]) - (1.0 - orig_pred_viz[valid_orig]))
+        if np.any(valid_proc):
+            proc_error[valid_proc] = np.abs((1.0 - gt_viz[valid_proc]) - (1.0 - proc_pred_viz[valid_proc]))
+    else:
+        # GT uses inverted mapping, predictions use direct mapping
+        if np.any(valid_orig):
+            orig_error[valid_orig] = np.abs((1.0 - gt_viz[valid_orig]) - orig_pred_viz[valid_orig])
+        if np.any(valid_proc):
+            proc_error[valid_proc] = np.abs((1.0 - gt_viz[valid_proc]) - proc_pred_viz[valid_proc])
     
     # Create a side-by-side error comparison
     h, w = gt_depth.shape
@@ -296,7 +335,7 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
             combined_error[valid_error] /= max_error
     
     # Apply colormap to combined error
-    cmap = plt.cm.jet
+    cmap = plt.colormaps['jet']
     error_rgb = cmap(combined_error)
     error_rgb = error_rgb[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
@@ -311,38 +350,198 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     plt.savefig(os.path.join(output_dir, f"{file_prefix}_combined.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
+class ModelWrapper:
+    """Wrapper class to unify different depth estimation models"""
+    
+    def __init__(self, model_type, device, **kwargs):
+        self.model_type = model_type
+        self.device = device
+        self.model = None
+        self.outputs_metric_depth = False  # True for metric depth, False for relative depth/disparity
+        
+        if model_type == 'depthanything':
+            self._init_depthanything(**kwargs)
+        elif model_type == 'zoedepth':
+            self._init_zoedepth(**kwargs)
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+    
+    def _init_depthanything(self, encoder='vitl', checkpoint_dir='checkpoints', metric=False):
+        """Initialize DepthAnything v2 model"""
+        model_configs = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+            'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+        }
+        
+        self.model = DepthAnythingV2(**model_configs[encoder])
+        model_path = os.path.join(checkpoint_dir, f"depth_anything_v2_{encoder}.pth")
+        
+        if metric:
+            model_path = os.path.join(checkpoint_dir, f"depth_anything_v2_metric_vkitti_{encoder}.pth")
+            self.outputs_metric_depth = True
+        
+        print(f"Loading DepthAnything v2 model from {model_path}")
+        self.model.load_state_dict(torch.load(model_path, map_location='cpu'))
+        self.model = self.model.to(self.device).eval()
+        
+    def _init_zoedepth(self, zoedepth_type='N', checkpoint_dir='checkpoints'):
+        """Initialize ZoeDepth model"""
+        if zoedepth_type == "N":
+            conf = get_config("zoedepth", "infer")
+        elif zoedepth_type == "K":
+            conf = get_config("zoedepth", "infer", config_version="kitti")
+        elif zoedepth_type == "NK":
+            conf = get_config("zoedepth_nk", "infer")
+        else:
+            raise ValueError(f"Unknown ZoeDepth type: {zoedepth_type}")
+        
+        # Remove pretrained resource to build model without loading weights
+        conf.pop("pretrained_resource", None)
+        conf["use_pretrained_midas"] = False
+        conf["train_midas"] = False
+        
+        self.model = build_model(conf)
+        
+        # Load weights
+        weights_path = os.path.join(checkpoint_dir, f"ZoeD_M12_{zoedepth_type}.pt")
+        print(f"Loading ZoeDepth model from {weights_path}")
+        
+        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=True)
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+        
+        missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            print(f"Missing keys: {missing_keys[:5]}...")  # Show first 5 only
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5 only
+        
+        # Apply compatibility patch after model is created
+        self._patch_zoedepth_model()
+        
+        self.model = self.model.to(self.device).eval()
+        # Based on visualization evidence, ZoeDepth appears to output disparity (near=blue, far=red)
+        # rather than metric depth as originally assumed
+        self.outputs_metric_depth = False  # ZoeDepth outputs disparity, not metric depth
+        
+    def _patch_zoedepth_model(self):
+        """Apply compatibility patches for ZoeDepth"""
+        # Simply patch individual instances to avoid class-level assignment issues
+        def patch_blocks(module):
+            for child in module.children():
+                if hasattr(child, '__class__') and 'Block' in child.__class__.__name__:
+                    if not hasattr(child, 'drop_path'):
+                        child.drop_path = lambda x: x
+                patch_blocks(child)
+        
+        # Apply instance-level patches
+        patch_blocks(self.model)
+        print("Applied drop_path compatibility patches to model instances")
+    
+    def predict(self, image, input_size=518):
+        """
+        Run inference on an image
+        
+        Args:
+            image: Input image (BGR format for DepthAnything, RGB for ZoeDepth)
+            input_size: Input size for inference
+            
+        Returns:
+            Predicted depth map
+        """
+        with torch.no_grad():
+            if self.model_type == 'depthanything':
+                return self.model.infer_image(image, input_size)
+            elif self.model_type == 'zoedepth':
+                # Convert BGR to RGB for ZoeDepth
+                if len(image.shape) == 3 and image.shape[2] == 3:
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    image_rgb = image
+                
+                # Create tensor
+                tensor = torch.from_numpy(image_rgb).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                tensor = tensor.to(self.device)
+                
+                return self.model.infer(tensor).cpu().numpy().squeeze()
+    
+    def postprocess_prediction(self, pred_depth, gt_depth_shape):
+        """
+        Post-process prediction based on model type
+        
+        Args:
+            pred_depth: Raw prediction from model
+            gt_depth_shape: Shape to resize to
+            
+        Returns:
+            processed_depth: Processed depth for metrics calculation
+            display_depth: Depth for visualization (original values)
+        """
+        # Resize to match ground truth
+        if pred_depth.shape != gt_depth_shape:
+            pred_depth = resize(pred_depth, gt_depth_shape, order=1, preserve_range=True)
+        
+        if self.outputs_metric_depth:
+            # This model outputs metric depth, keep as depth for metrics calculation
+            processed_depth = pred_depth  # Keep as metric depth
+            display_depth = pred_depth.copy()  # Keep as metric depth for consistent visualization
+            
+            # For metrics calculation: pred is depth, gt is disparity
+            is_pred_disparity = False  # Pred is metric depth, not disparity
+        else:
+            # Non-metric models: distinguish between DepthAnything (relative depth) and ZoeDepth (disparity)
+            if self.model_type == 'zoedepth':
+                # ZoeDepth: based on visualization evidence, outputs disparity
+                processed_depth = pred_depth  # Keep as disparity
+                display_depth = pred_depth.copy()  # Keep as disparity for visualization
+                is_pred_disparity = True  # Pred is disparity (same as GT)
+            else:
+                # DepthAnything: outputs relative depth, not disparity
+                processed_depth = pred_depth  # Keep as relative depth
+                display_depth = pred_depth.copy()  # Keep as relative depth for visualization
+                is_pred_disparity = False  # Pred is relative depth, will be converted to depth in metrics
+        
+        return processed_depth, display_depth, is_pred_disparity
+
 def validate_flsea(args):
     """
-    Validate Depth-Anything-V2 on FLSea dataset
+    Validate depth estimation models on FLSea dataset
     
     Args:
         args: Command line arguments
     """
     print("Initializing model...")
     
-    # Model configuration
-    model_configs = {
-        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-        'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
-    }
-    
-    # Initialize model
+    # Initialize device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Use underwater/outdoor model configuration since underwater imagery is closer to outdoor than indoor
-    model = DepthAnythingV2(**model_configs[args.encoder])
-    model_path = os.path.join(args.checkpoint_dir, f"depth_anything_v2_{args.encoder}.pth")
+    # Initialize model wrapper
+    if args.model_type == 'depthanything':
+        model = ModelWrapper(
+            model_type='depthanything',
+            device=device,
+            encoder=args.encoder,
+            checkpoint_dir=args.checkpoint_dir,
+            metric=args.metric
+        )
+        model_name = f"DepthAnything-v2-{args.encoder}" + ("-metric" if args.metric else "")
+    elif args.model_type == 'zoedepth':
+        model = ModelWrapper(
+            model_type='zoedepth',
+            device=device,
+            zoedepth_type=args.zoedepth_type,
+            checkpoint_dir=args.checkpoint_dir
+        )
+        model_name = f"ZoeDepth-{args.zoedepth_type}"
+    else:
+        raise ValueError(f"Unsupported model type: {args.model_type}")
     
-    if args.metric:
-        # Use metric model if specified
-        model_path = os.path.join(args.checkpoint_dir, f"depth_anything_v2_metric_vkitti_{args.encoder}.pth")
-    
-    print(f"Loading model from {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
-    model = model.to(device).eval()
+    print(f"Model: {model_name}")
     
     # Create FLSea dataset
     print(f"Loading FLSea dataset from {args.data_root}")
@@ -400,58 +599,40 @@ def validate_flsea(args):
                 print(f"Invalid sample at index {idx}")
                 continue
             
-            # Prepare images for model
-            input_size = args.input_size
-            
             # Run inference on both original and processed images
-            with torch.no_grad():
-                # Run model on original image
-                orig_pred_depth = model.infer_image(original_image, input_size)
-                
-                # Run model on processed image
-                proc_pred_depth = model.infer_image(processed_image, input_size)
-                
-                # Resize predictions to match ground truth
-                if orig_pred_depth.shape != gt_depth.shape:
-                    orig_pred_depth = resize(orig_pred_depth, gt_depth.shape, order=1, preserve_range=True)
-                
-                if proc_pred_depth.shape != gt_depth.shape:
-                    proc_pred_depth = resize(proc_pred_depth, gt_depth.shape, order=1, preserve_range=True)
+            orig_pred_depth = model.predict(original_image, args.input_size)
+            proc_pred_depth = model.predict(processed_image, args.input_size)
             
-            # Create combined visualization
+            # Post-process predictions based on model type
+            orig_pred_processed, orig_pred_display, is_pred_disparity = model.postprocess_prediction(orig_pred_depth, gt_depth.shape)
+            proc_pred_processed, proc_pred_display, _ = model.postprocess_prediction(proc_pred_depth, gt_depth.shape)
+            
+            # Create combined visualization (using display depth for better visualization)
             visualize_comparison_combined(
                 original_image, processed_image, gt_depth, 
-                orig_pred_depth, proc_pred_depth,
-                basename, args.output_dir
+                orig_pred_display, proc_pred_display,
+                basename, args.output_dir, pred_is_disparity=is_pred_disparity
             )
             
-            # Compute metrics for both original and processed images
-            metrics_orig_sample = compute_depth_metrics(orig_pred_depth, gt_depth, is_gt_disparity=True)
-            metrics_proc_sample = compute_depth_metrics(proc_pred_depth, gt_depth, is_gt_disparity=True)
+            # Compute metrics: Follow original script logic
+            # ZoeDepth: treat output as metric depth, GT as disparity  
+            # DepthAnything: treat output as relative depth, GT as disparity
+            metrics_orig_sample = compute_depth_metrics(
+                orig_pred_processed, gt_depth, 
+                is_gt_disparity=True, is_pred_disparity=is_pred_disparity
+            )
+            metrics_proc_sample = compute_depth_metrics(
+                proc_pred_processed, gt_depth, 
+                is_gt_disparity=True, is_pred_disparity=is_pred_disparity
+            )
             
-            # Add to totals
+            # Add to totals for metrics calculation
             for k, v in metrics_orig_sample.items():
                 metrics_orig[k] += v
             for k, v in metrics_proc_sample.items():
                 metrics_proc[k] += v
             
             valid_samples += 1
-            
-            # Save individual metrics to a CSV file
-            metrics_file = os.path.join(args.output_dir, 'individual_metrics.csv')
-            if not os.path.exists(metrics_file):
-                with open(metrics_file, 'w') as f:
-                    header = 'filename,image_type,' + ','.join(metrics_orig_sample.keys())
-                    f.write(header + '\n')
-            
-            with open(metrics_file, 'a') as f:
-                # Add metrics for original image
-                values_orig = basename + ',original,' + ','.join([f"{v:.6f}" for v in metrics_orig_sample.values()])
-                f.write(values_orig + '\n')
-                
-                # Add metrics for processed image
-                values_proc = basename + ',processed,' + ','.join([f"{v:.6f}" for v in metrics_proc_sample.values()])
-                f.write(values_proc + '\n')
         
         except Exception as e:
             print(f"Error processing sample at index {idx}: {e}")
@@ -465,6 +646,10 @@ def validate_flsea(args):
         
         # Calculate average metrics for processed images
         avg_metrics_proc = {k: v / valid_samples for k, v in metrics_proc.items()}
+        
+        # Print model information
+        print(f"\nModel: {model_name}")
+        print(f"Outputs metric depth: {model.outputs_metric_depth}")
         
         # Print metrics for original images
         print("\nOriginal Images - Average Metrics:")
@@ -514,6 +699,8 @@ def validate_flsea(args):
         
         # Save overall metrics to a JSON file
         serializable_metrics = {
+            'model': model_name,
+            'outputs_metric_depth': model.outputs_metric_depth,
             'original': {k: float(v) for k, v in avg_metrics_orig.items()},
             'processed': {k: float(v) for k, v in avg_metrics_proc.items()}
         }
@@ -523,27 +710,52 @@ def validate_flsea(args):
         print("No valid samples processed.")
 
 def main():
-    parser = argparse.ArgumentParser(description='Depth-Anything-V2 Evaluation on FLSea Dataset')
+    parser = argparse.ArgumentParser(description='Unified Depth Model Evaluation on FLSea Dataset')
     
+    # Common arguments
+    parser.add_argument('--model-type', type=str, required=True,
+                        choices=['depthanything', 'zoedepth'],
+                        help='Type of depth estimation model to use')
     parser.add_argument('--data-root', type=str, default='assets/FLSea/red_sea/pier_path',
                         help='Path to FLSea dataset')
-    parser.add_argument('--output-dir', type=str, default='visualizations/flsea_depth_anything_v2',
+    parser.add_argument('--output-dir', type=str, default='visualizations/flsea_test',
                         help='Output directory for visualizations and metrics')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Directory containing model checkpoints')
-    parser.add_argument('--encoder', type=str, default='vitl',
-                        choices=['vits', 'vitb', 'vitl', 'vitg'],
-                        help='Encoder type for Depth-Anything-V2 model')
     parser.add_argument('--input-size', type=int, default=518,
                         help='Input size for model inference')
-    parser.add_argument('--metric', default=False, action='store_true',
-                        help='Use metric depth estimation model')
     parser.add_argument('--num-samples', type=int, default=10,
                         help='Number of samples to evaluate. Use -1 to evaluate all samples')
     parser.add_argument('--random-samples', action='store_true',
                         help='Select random samples instead of the first N')
     
+    # DepthAnything specific arguments
+    parser.add_argument('--encoder', type=str, default='vitl',
+                        choices=['vits', 'vitb', 'vitl', 'vitg'],
+                        help='DepthAnything v2 encoder type')
+    parser.add_argument('--metric', action='store_true',
+                        help='Use metric DepthAnything v2 model')
+    
+    # ZoeDepth specific arguments
+    parser.add_argument('--zoedepth-type', type=str, default='N',
+                        choices=['N', 'K', 'NK'],
+                        help='ZoeDepth model type: N (Indoor/outdoor), K (Outdoor), NK (Outdoor with NYU encoder)')
+    
     args = parser.parse_args()
+    
+    # Update output directory to include model information
+    if args.model_type == 'depthanything':
+        model_suffix = f"depthanything_{args.encoder}" + ("_metric" if args.metric else "")
+    elif args.model_type == 'zoedepth':
+        model_suffix = f"zoedepth_{args.zoedepth_type}"
+    else:
+        model_suffix = args.model_type
+    
+    # Create a descriptive output directory name
+    base_output_dir = args.output_dir
+    args.output_dir = os.path.join(base_output_dir, model_suffix)
+    
+    print(f"Output directory: {args.output_dir}")
     
     validate_flsea(args)
 
