@@ -219,21 +219,21 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     cm_jet = plt.colormaps['jet']  # Modern way to get colormap
     
     # For depth maps: near=red (1.0), far=blue (0.0), invalid=black
-    # Ground truth (disparity map, so we DON'T invert the colors - use gt_viz directly)
+    # Ground truth (disparity map, so we invert colors to make near=red, far=blue)
     gt_colored = np.zeros((*gt_viz.shape, 4), dtype=np.float32)
-    gt_colored[gt_valid] = cm_jet(gt_viz[gt_valid])  # Use direct value for disparity map (near=blue, far=red)
+    gt_colored[gt_valid] = cm_jet(1.0 - gt_viz[gt_valid])  # Invert disparity map colors (near=red, far=blue)
     gt_colored[~gt_valid, 3] = 0  # Set alpha=0 for invalid regions
     gt_rgb = gt_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
-    # Original prediction (depth map, so we invert colors as usual)
+    # Original prediction (depth map, so we don't invert colors to keep near=red, far=blue)
     orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
-    orig_pred_colored[orig_pred_valid] = cm_jet(1.0 - orig_pred_viz[orig_pred_valid])
+    orig_pred_colored[orig_pred_valid] = cm_jet(orig_pred_viz[orig_pred_valid])  # Direct mapping for depth (near=red, far=blue)
     orig_pred_colored[~orig_pred_valid, 3] = 0
     orig_pred_rgb = orig_pred_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
     # Processed prediction
     proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
-    proc_pred_colored[proc_pred_valid] = cm_jet(1.0 - proc_pred_viz[proc_pred_valid])
+    proc_pred_colored[proc_pred_valid] = cm_jet(proc_pred_viz[proc_pred_valid])  # Direct mapping for depth (near=red, far=blue)
     proc_pred_colored[~proc_pred_valid, 3] = 0
     proc_pred_rgb = proc_pred_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
@@ -253,25 +253,25 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     
     plt.subplot(2, 3, 3)
     plt.imshow(gt_rgb)
-    plt.title('Ground Truth Disparity')
+    plt.title('Ground Truth Disparity (Near=Red, Far=Blue)')
     plt.axis('off')
     
     # Second row: Depth predictions and error maps
     plt.subplot(2, 3, 4)
     plt.imshow(orig_pred_rgb)
-    plt.title('Original Image Depth Prediction')
+    plt.title('Original Image Depth Prediction (Near=Red, Far=Blue)')
     plt.axis('off')
     
     plt.subplot(2, 3, 5)
     plt.imshow(proc_pred_rgb)
-    plt.title('Processed Image Depth Prediction')
+    plt.title('Processed Image Depth Prediction (Near=Red, Far=Blue)')
     plt.axis('off')
     
     # Compute error maps
     plt.subplot(2, 3, 6)
     
     # Compute error for both original and processed predictions
-    # 视差图与深度图相反，所以在计算误差时需要使用 1.0 - gt_viz
+    # Since we now use consistent color mapping for all depth maps (near=red, far=blue)
     orig_error = np.zeros_like(gt_depth)
     proc_error = np.zeros_like(gt_depth)
     valid_orig = gt_valid & orig_pred_valid
@@ -527,7 +527,7 @@ def main():
     
     parser.add_argument('--data-root', type=str, default='assets/FLSea/red_sea/pier_path',
                         help='Path to FLSea dataset')
-    parser.add_argument('--output-dir', type=str, default='visualizations/flsea',
+    parser.add_argument('--output-dir', type=str, default='visualizations/flsea_depth_anything_v2',
                         help='Output directory for visualizations and metrics')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Directory containing model checkpoints')
