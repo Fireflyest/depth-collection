@@ -75,6 +75,10 @@ def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disp
         align_method: method for scale alignment ('median', 'mean', 'least_squares')
         is_gt_disparity: whether the ground truth is a disparity map (inverse depth)
         is_pred_disparity: whether the prediction is a disparity map (inverse depth)
+                          Note: For non-metric models, this includes:
+                          - Absolute disparity (1/depth with known scale)
+                          - Relative/normalized disparity (inverse proportional to depth)
+                          - Other inverse-depth-like representations
         
     Returns:
         Dictionary of metrics
@@ -165,7 +169,7 @@ def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disp
         'spearman_corr': spearman_corr
     }
 
-def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth, proc_pred_depth, file_prefix, output_dir, pred_is_disparity=False, outputs_metric_depth=False):
+def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth, proc_pred_depth, file_prefix, output_dir, pred_is_disparity=False, outputs_metric_depth=False, conversion_info=None):
     """
     Create a combined visualization comparing original and processed images with their depth predictions
     
@@ -178,6 +182,8 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
         file_prefix: Prefix for saved files
         output_dir: Directory to save visualizations
         pred_is_disparity: Whether predictions are disparity maps or relative depth
+                         Note: disparity can be absolute disparity (1/depth) or 
+                         relative/normalized disparity (proportional to 1/depth)
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -207,7 +213,7 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     if gt_valid_depths:
         gt_valid_values = np.concatenate(gt_valid_depths)
         gt_min_depth, gt_max_depth = np.percentile(gt_valid_values, [2, 98])
-        gt_range_text = f"GT Depth: {gt_min_depth:.2f} - {gt_max_depth:.2f} (meters)"
+        gt_range_text = f"GT Depth: {gt_min_depth:.4f} - {gt_max_depth:.4f} (meters)"
         
         # 为gt单独归一化
         if np.any(gt_valid):
@@ -221,25 +227,25 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
         pred_min_depth, pred_max_depth = np.percentile(pred_valid_values, [5, 95])
         
         if pred_is_disparity:
-            # Case: outputs disparity (both ZoeDepth non-metric and DepthAnything)
+            # Case: outputs relative/normalized disparity (both ZoeDepth non-metric and DepthAnything)
             # Convert disparity range to depth range for better understanding
             pred_as_depth_max = 1.0 / (pred_min_depth + 1e-6)  # min disparity -> max depth
             pred_as_depth_min = 1.0 / (pred_max_depth + 1e-6)  # max disparity -> min depth
             
             if outputs_metric_depth:
                 # This shouldn't happen, but handle it gracefully
-                pred_range_text = f"Pred Disparity: {pred_min_depth:.2f} - {pred_max_depth:.2f}\nAs Depth: {pred_as_depth_min:.2f} - {pred_as_depth_max:.2f} (meters)"
+                pred_range_text = f"Pred Rel-Disparity: {pred_min_depth:.4f} - {pred_max_depth:.4f}\nAs Depth: {pred_as_depth_min:.4f} - {pred_as_depth_max:.4f} (meters)"
             else:
-                # Both ZoeDepth (non-metric) and DepthAnything output disparity-like values
-                pred_range_text = f"Pred Disparity: {pred_min_depth:.2f} - {pred_max_depth:.2f}\nAs Depth: {pred_as_depth_min:.2f} - {pred_as_depth_max:.2f} (relative scale)"
+                # Both ZoeDepth (non-metric) and DepthAnything output relative disparity-like values
+                pred_range_text = f"Pred Rel-Disparity: {pred_min_depth:.4f} - {pred_max_depth:.4f}\nAs Depth: {pred_as_depth_min:.4f} - {pred_as_depth_max:.4f} (relative scale)"
         else:
             # Case: outputs depth (ZoeDepth metric mode)
             if outputs_metric_depth:
                 # ZoeDepth case: outputs metric depth in meters
-                pred_range_text = f"Pred Depth: {pred_min_depth:.2f} - {pred_max_depth:.2f} (m)"
+                pred_range_text = f"Pred Depth: {pred_min_depth:.4f} - {pred_max_depth:.4f} (m)"
             else:
                 # This shouldn't happen now, but handle it gracefully
-                pred_range_text = f"Pred Depth: {pred_min_depth:.2f} - {pred_max_depth:.2f} (relative scale)"
+                pred_range_text = f"Pred Depth: {pred_min_depth:.4f} - {pred_max_depth:.4f} (relative scale)"
         
         # 归一化预测深度
         if np.any(orig_pred_valid):
@@ -318,7 +324,7 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
         for y_pos in y_positions:
             if gt_valid[y_pos, x_center]:
                 depth_val = gt_depth[y_pos, x_center]
-                plt.annotate(f'{depth_val:.2f}m', 
+                plt.annotate(f'{depth_val:.4f}m', 
                            xy=(x_center, y_pos), 
                            xytext=(x_center + w//8, y_pos),
                            fontsize=8, color='white', weight='bold',
@@ -342,20 +348,58 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
             if orig_pred_valid[y_pos, x_center]:
                 pred_val = orig_pred_depth[y_pos, x_center]
                 
-                if pred_is_disparity:
-                    # Prediction is disparity, convert to depth
-                    depth_meters = 1.0 / (pred_val + 1e-6)
-                    label = f'{depth_meters:.2f}m'
-                else:
-                    # Prediction is depth
-                    if outputs_metric_depth:
-                        # ZoeDepth metric case: show depth in meters
-                        label = f'{pred_val:.2f}m'
+                # Calculate display labels based on conversion info
+                if conversion_info and conversion_info.get('applied', False):
+                    # Unit conversion was applied (e.g., DepthAnything disparity->km->m)
+                    if conversion_info['original_unit'] == 'disparity->km':
+                        # DepthAnything: show original disparity and converted depth
+                        # To get original disparity: disparity = 1 / (depth_m / 1000)
+                        depth_km = pred_val / 1000.0  # Convert meters back to km
+                        original_disparity = 1.0 / (depth_km + 1e-6)  # Get original disparity
+                        raw_label = f'{original_disparity:.4f}(disp)'
+                        meter_label = f'\n→{pred_val:.4f}m'
                     else:
-                        # Relative depth case: show relative value
-                        label = f'rel:{pred_val:.2f}'
+                        # Other conversions 
+                        original_val = pred_val / conversion_info['factor']  # Convert back to original units
+                        raw_label = f'{original_val:.4f}({conversion_info["original_unit"][:2]})'
+                        meter_label = f'\n→{pred_val:.4f}m'
+                elif outputs_metric_depth:
+                    # Already in meters (e.g., ZoeDepth metric)
+                    raw_label = f'{pred_val:.4f}m'
+                    meter_label = ''  # No need to show conversion, already in meters
+                else:
+                    # Non-metric models without unit conversion (e.g., ZoeDepth non-metric)
+                    if pred_is_disparity:
+                        # Disparity-like values: convert 1/disparity to get rough depth
+                        meter_val = 1.0 / (pred_val + 1e-6) if pred_val > 0 else float('inf')
+                        raw_label = f'{pred_val:.4f}(disp-rel)'
+                        if meter_val != float('inf') and meter_val < 1000:  # Reasonable depth range
+                            meter_label = f'\n≈{meter_val:.4f}m'
+                        else:
+                            meter_label = '\n≈∞m'
+                    else:
+                        # Relative depth: need scale alignment with GT to get meters
+                        # For visualization, we'll use a rough estimation based on median scaling
+                        if gt_valid_depths:
+                            gt_sample = gt_depth[gt_valid]
+                            pred_sample = orig_pred_depth[orig_pred_valid & gt_valid]
+                            if len(pred_sample) > 0 and len(gt_sample) > 0:
+                                # Rough scale estimation using median ratio
+                                scale = np.median(gt_sample) / np.median(pred_sample)
+                                meter_val = pred_val * scale
+                                raw_label = f'{pred_val:.4f}(rel)'
+                                meter_label = f'\n≈{meter_val:.4f}m'
+                            else:
+                                raw_label = f'{pred_val:.4f}(rel)'
+                                meter_label = '\n≈?m'
+                        else:
+                            raw_label = f'{pred_val:.4f}(rel)'
+                            meter_label = '\n≈?m'
                 
-                plt.annotate(label, 
+                # Combine raw and meter labels
+                full_label = raw_label + meter_label
+                
+                plt.annotate(full_label, 
                            xy=(x_center, y_pos), 
                            xytext=(x_center + w//10, y_pos),
                            fontsize=8, color='white', weight='bold',
@@ -368,7 +412,7 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     plt.imshow(proc_pred_rgb)
     plt.title(f'Processed Image {pred_title_suffix}\n{pred_range_text}')
     
-    # Add depth scale markers for processed predictions (same logic as original)
+    # Add depth scale markers for processed predictions
     if pred_valid_depths:
         h, w = proc_pred_depth.shape
         x_center = w // 2
@@ -378,19 +422,58 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
             if proc_pred_valid[y_pos, x_center]:
                 pred_val = proc_pred_depth[y_pos, x_center]
                 
-                if pred_is_disparity:
-                    depth_meters = 1.0 / (pred_val + 1e-6)
-                    label = f'{depth_meters:.2f}m'
-                else:
-                    # Prediction is depth
-                    if outputs_metric_depth:
-                        # ZoeDepth metric case: show depth in meters
-                        label = f'{pred_val:.2f}m'
+                # Calculate display labels based on conversion info  
+                if conversion_info and conversion_info.get('applied', False):
+                    # Unit conversion was applied (e.g., DepthAnything disparity->km->m)
+                    if conversion_info['original_unit'] == 'disparity->km':
+                        # DepthAnything: show original disparity and converted depth
+                        # To get original disparity: disparity = 1 / (depth_m / 1000)
+                        depth_km = pred_val / 1000.0  # Convert meters back to km
+                        original_disparity = 1.0 / (depth_km + 1e-6)  # Get original disparity
+                        raw_label = f'{original_disparity:.4f}(disp)'
+                        meter_label = f'\n→{pred_val:.4f}m'
                     else:
-                        # Relative depth case: show relative value
-                        label = f'rel:{pred_val:.2f}'
+                        # Other conversions 
+                        original_val = pred_val / conversion_info['factor']  # Convert back to original units
+                        raw_label = f'{original_val:.4f}({conversion_info["original_unit"][:2]})'
+                        meter_label = f'\n→{pred_val:.4f}m'
+                elif outputs_metric_depth:
+                    # Already in meters (e.g., ZoeDepth metric)
+                    raw_label = f'{pred_val:.4f}m'
+                    meter_label = ''  # No need to show conversion, already in meters
+                else:
+                    # Non-metric models without unit conversion (e.g., ZoeDepth non-metric)
+                    if pred_is_disparity:
+                        # Disparity-like values: convert 1/disparity to get rough depth
+                        meter_val = 1.0 / (pred_val + 1e-6) if pred_val > 0 else float('inf')
+                        raw_label = f'{pred_val:.4f}(disp-rel)'
+                        if meter_val != float('inf') and meter_val < 1000:  # Reasonable depth range
+                            meter_label = f'\n≈{meter_val:.4f}m'
+                        else:
+                            meter_label = '\n≈∞m'
+                    else:
+                        # Relative depth: need scale alignment with GT to get meters
+                        # For visualization, we'll use a rough estimation based on median scaling
+                        if gt_valid_depths:
+                            gt_sample = gt_depth[gt_valid]
+                            pred_sample = proc_pred_depth[proc_pred_valid & gt_valid]
+                            if len(pred_sample) > 0 and len(gt_sample) > 0:
+                                # Rough scale estimation using median ratio
+                                scale = np.median(gt_sample) / np.median(pred_sample)
+                                meter_val = pred_val * scale
+                                raw_label = f'{pred_val:.4f}(rel)'
+                                meter_label = f'\n≈{meter_val:.4f}m'
+                            else:
+                                raw_label = f'{pred_val:.4f}(rel)'
+                                meter_label = '\n≈?m'
+                        else:
+                            raw_label = f'{pred_val:.4f}(rel)'
+                            meter_label = '\n≈?m'
                 
-                plt.annotate(label, 
+                # Combine raw and meter labels
+                full_label = raw_label + meter_label
+                
+                plt.annotate(full_label, 
                            xy=(x_center, y_pos), 
                            xytext=(x_center + w//10, y_pos),
                            fontsize=8, color='white', weight='bold',
@@ -399,27 +482,43 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     
     plt.axis('off')
     
-    # Compute error maps
+    # Compute error maps - use same normalization as metrics calculation
     plt.subplot(2, 3, 6)
     
-    # Compute error for both original and processed predictions
+    # Compute error in original depth space (same as metrics calculation)
     orig_error = np.zeros_like(gt_depth)
     proc_error = np.zeros_like(gt_depth)
     valid_orig = gt_valid & orig_pred_valid
     valid_proc = gt_valid & proc_pred_valid
     
+    # Convert predictions to depth domain if needed (same as in compute_depth_metrics)
+    orig_pred_depth = orig_pred_depth.copy()
+    proc_pred_depth = proc_pred_depth.copy()
+    gt_for_error = gt_depth.copy()
+    
+    eps = 1e-6
+    
+    # Convert to depth domain (same logic as compute_depth_metrics)
     if pred_is_disparity:
-        # Both GT and predictions use inverted mapping, so compute error directly
         if np.any(valid_orig):
-            orig_error[valid_orig] = np.abs((1.0 - gt_viz[valid_orig]) - (1.0 - orig_pred_viz[valid_orig]))
+            orig_pred_depth[valid_orig] = 1.0 / (orig_pred_depth[valid_orig] + eps)
         if np.any(valid_proc):
-            proc_error[valid_proc] = np.abs((1.0 - gt_viz[valid_proc]) - (1.0 - proc_pred_viz[valid_proc]))
-    else:
-        # GT uses inverted mapping, predictions use direct mapping
-        if np.any(valid_orig):
-            orig_error[valid_orig] = np.abs((1.0 - gt_viz[valid_orig]) - orig_pred_viz[valid_orig])
-        if np.any(valid_proc):
-            proc_error[valid_proc] = np.abs((1.0 - gt_viz[valid_proc]) - proc_pred_viz[valid_proc])
+            proc_pred_depth[valid_proc] = 1.0 / (proc_pred_depth[valid_proc] + eps)
+    
+    # Apply scale alignment (same as in compute_depth_metrics)
+    if np.any(valid_orig):
+        scale_orig, orig_pred_aligned = align_depth_scale(
+            orig_pred_depth[valid_orig], gt_for_error[valid_orig], method='median'
+        )
+        # Compute absolute error in meters (same as metrics)
+        orig_error[valid_orig] = np.abs(gt_for_error[valid_orig] - orig_pred_aligned)
+    
+    if np.any(valid_proc):
+        scale_proc, proc_pred_aligned = align_depth_scale(
+            proc_pred_depth[valid_proc], gt_for_error[valid_proc], method='median'
+        )
+        # Compute absolute error in meters (same as metrics)
+        proc_error[valid_proc] = np.abs(gt_for_error[valid_proc] - proc_pred_aligned)
     
     # Create a side-by-side error comparison
     h, w = gt_depth.shape
@@ -427,20 +526,39 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     combined_error[:, :w] = orig_error
     combined_error[:, w:] = proc_error
     
-    # Normalize the combined error for visualization
+    # Normalize for visualization (now represents actual meter-scale errors)
     valid_error = (combined_error > 0)
     if np.any(valid_error):
-        max_error = np.max(combined_error[valid_error])
-        if max_error > 0:
-            combined_error[valid_error] /= max_error
+        # Use percentile-based normalization instead of max to avoid outliers
+        error_95th = np.percentile(combined_error[valid_error], 95)
+        if error_95th > 0:
+            combined_error_viz = np.clip(combined_error / error_95th, 0, 1)
+        else:
+            combined_error_viz = combined_error
+        
+        # Calculate error statistics for display
+        orig_errors = orig_error[orig_error > 0]
+        proc_errors = proc_error[proc_error > 0]
+        
+        if len(orig_errors) > 0 and len(proc_errors) > 0:
+            avg_orig_error = np.mean(orig_errors)
+            avg_proc_error = np.mean(proc_errors)
+            improvement = (avg_orig_error - avg_proc_error) / avg_orig_error * 100
+            
+            error_title = f'Absolute Error Maps (meters)\nOriginal: {avg_orig_error:.4f}m, Processed: {avg_proc_error:.4f}m\nImprovement: {improvement:.1f}%'
+        else:
+            error_title = 'Absolute Error Maps (meters)\nOriginal (left) vs Processed (right)'
+    else:
+        combined_error_viz = combined_error
+        error_title = 'Absolute Error Maps (meters)\nOriginal (left) vs Processed (right)'
     
     # Apply colormap to combined error
-    cmap = plt.colormaps['jet']
-    error_rgb = cmap(combined_error)
+    cmap = plt.colormaps['hot']  # Use 'hot' colormap for errors (black=no error, red/yellow=high error)
+    error_rgb = cmap(combined_error_viz)
     error_rgb = error_rgb[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
     plt.imshow(error_rgb)
-    plt.title('Error Maps: Original (left) vs Processed (right)')
+    plt.title(error_title)
     plt.axis('off')
     
     # Add a vertical line to separate the two error maps
@@ -579,10 +697,14 @@ class ModelWrapper:
         Returns:
             processed_depth: Processed depth for metrics calculation
             display_depth: Depth for visualization (original values)
+            is_pred_disparity: Whether the processed prediction is disparity-like
+            conversion_info: Information about unit conversion applied
         """
         # Resize to match ground truth
         if pred_depth.shape != gt_depth_shape:
             pred_depth = resize(pred_depth, gt_depth_shape, order=1, preserve_range=True)
+        
+        conversion_info = {'applied': False, 'factor': 1.0, 'original_unit': 'unknown', 'target_unit': 'meters'}
         
         if self.outputs_metric_depth:
             # This model outputs metric depth, keep as depth for metrics calculation
@@ -591,21 +713,38 @@ class ModelWrapper:
             
             # For metrics calculation: pred is depth (same as GT)
             is_pred_disparity = False  # Pred is metric depth, not disparity
+            conversion_info.update({'original_unit': 'meters', 'target_unit': 'meters'})
         else:
             # Non-metric models: both DepthAnything and ZoeDepth output disparity-like values
             if self.model_type == 'zoedepth':
-                # ZoeDepth: when not metric, outputs disparity
-                processed_depth = pred_depth  # Keep as disparity
-                display_depth = pred_depth.copy()  # Keep as disparity for visualization
-                is_pred_disparity = True  # Pred is disparity
+                # ZoeDepth: when not metric, outputs relative/normalized disparity
+                # (proportional to 1/depth but not absolute disparity = 1/depth)
+                processed_depth = pred_depth  # Keep as relative disparity
+                display_depth = pred_depth.copy()  # Keep as relative disparity for visualization
+                is_pred_disparity = True  # Pred is relative disparity
+                conversion_info.update({'original_unit': 'relative_disparity', 'target_unit': 'relative_disparity'})
             else:
-                # DepthAnything: based on visualization evidence, also outputs disparity-like values
-                # (far regions have small values, near regions have large values)
-                processed_depth = pred_depth  # Keep as disparity-like values
-                display_depth = pred_depth.copy()  # Keep as disparity-like values for visualization
-                is_pred_disparity = True  # Pred is disparity-like
+                # DepthAnything: outputs disparity (inverse depth)
+                # When converted to depth via 1/disparity, the depth unit is kilometers
+                # Need to convert from kilometers to meters by multiplying by 1000
+                # Step 1: Convert disparity to depth (km): depth_km = 1/disparity
+                # Step 2: Convert depth from km to meters: depth_m = depth_km * 1000
+                # Combined: depth_m = (1/disparity) * 1000 = 1000/disparity
+                
+                # For metrics calculation: convert disparity to depth in meters
+                eps = 1e-6
+                depth_km = 1.0 / (pred_depth + eps)  # disparity -> depth in km
+                processed_depth = depth_km * 1000.0  # convert km to meters
+                display_depth = processed_depth.copy()  # depth in meters for visualization
+                is_pred_disparity = False  # After conversion, pred is now depth in meters
+                conversion_info.update({
+                    'applied': True, 
+                    'factor': 1000.0, 
+                    'original_unit': 'disparity->km', 
+                    'target_unit': 'meters'
+                })
         
-        return processed_depth, display_depth, is_pred_disparity
+        return processed_depth, display_depth, is_pred_disparity, conversion_info
 
 def validate_flsea(args):
     """
@@ -704,15 +843,16 @@ def validate_flsea(args):
             proc_pred_depth = model.predict(processed_image, args.input_size)
             
             # Post-process predictions based on model type
-            orig_pred_processed, orig_pred_display, is_pred_disparity = model.postprocess_prediction(orig_pred_depth, gt_depth.shape)
-            proc_pred_processed, proc_pred_display, _ = model.postprocess_prediction(proc_pred_depth, gt_depth.shape)
+            orig_pred_processed, orig_pred_display, is_pred_disparity, orig_conversion_info = model.postprocess_prediction(orig_pred_depth, gt_depth.shape)
+            proc_pred_processed, proc_pred_display, _, proc_conversion_info = model.postprocess_prediction(proc_pred_depth, gt_depth.shape)
             
             # Create combined visualization (using display depth for better visualization)
             visualize_comparison_combined(
                 original_image, processed_image, gt_depth, 
                 orig_pred_display, proc_pred_display,
                 basename, args.output_dir, pred_is_disparity=is_pred_disparity,
-                outputs_metric_depth=model.outputs_metric_depth
+                outputs_metric_depth=model.outputs_metric_depth,
+                conversion_info=orig_conversion_info
             )
             
             # Compute metrics: GT is now confirmed as depth, not disparity
