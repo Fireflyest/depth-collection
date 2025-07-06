@@ -25,6 +25,8 @@ import json
 import random
 import warnings
 from skimage.transform import resize
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 # Import models
 from depth_anything_v2.dpt import DepthAnythingV2
@@ -37,6 +39,97 @@ from flsea_dataset import FLSeaDataset
 # Suppress warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
+
+@dataclass
+class ModelOutputCharacteristics:
+    """
+    Describes the characteristics of a model's output
+    """
+    # Output type
+    is_disparity: bool  # True if output is disparity, False if depth
+    is_metric: bool     # True if output has metric scale, False if relative
+    
+    # Unit information
+    output_unit: str    # Original output unit (e.g., 'disparity', 'meters', 'millimeters')
+    target_unit: str    # Target unit for processing (typically 'meters')
+    
+    # Conversion parameters
+    needs_inversion: bool = False  # True if disparity->depth conversion needed
+    scale_factor: float = 1.0      # Multiplication factor for unit conversion
+    
+    # Display information
+    display_name: str = ""         # Human readable description
+    
+    def __post_init__(self):
+        if not self.display_name:
+            if self.is_disparity:
+                if self.is_metric:
+                    self.display_name = f"Metric Disparity ({self.output_unit})"
+                else:
+                    self.display_name = f"Relative Disparity ({self.output_unit})"
+            else:
+                if self.is_metric:
+                    self.display_name = f"Metric Depth ({self.output_unit})"
+                else:
+                    self.display_name = f"Relative Depth ({self.output_unit})"
+    
+    def convert_to_target_unit(self, data: np.ndarray) -> Tuple[np.ndarray, dict]:
+        """
+        Convert model output to target unit
+        
+        Returns:
+            converted_data: Data in target unit
+            conversion_info: Information about the conversion applied
+        """
+        eps = 1e-6
+        conversion_info = {
+            'applied': False,
+            'factor': self.scale_factor,
+            'original_unit': self.output_unit,
+            'target_unit': self.target_unit
+        }
+        
+        if self.needs_inversion and self.scale_factor != 1.0:
+            # Case: disparity -> depth with unit conversion
+            # Example: DepthAnything disparity -> km -> meters
+            depth_intermediate = 1.0 / (data + eps)  # disparity -> intermediate depth
+            converted_data = depth_intermediate * self.scale_factor  # apply scale
+            conversion_info['applied'] = True
+        elif self.needs_inversion:
+            # Case: disparity -> depth without unit conversion
+            # Example: ZoeDepth relative disparity -> relative depth
+            converted_data = 1.0 / (data + eps)
+        elif self.scale_factor != 1.0:
+            # Case: unit conversion without inversion
+            # Example: millimeters -> meters
+            converted_data = data * self.scale_factor
+            conversion_info['applied'] = True
+        else:
+            # Case: no conversion needed
+            # Example: ZoeDepth metric depth in meters
+            converted_data = data.copy()
+        
+        return converted_data, conversion_info
+    
+    def get_original_value_from_converted(self, converted_value: float) -> float:
+        """
+        Get original model output value from converted value (for visualization)
+        """
+        eps = 1e-6
+        
+        if self.needs_inversion and self.scale_factor != 1.0:
+            # converted_value = (1/original) * scale_factor
+            # original = 1 / (converted_value / scale_factor)
+            intermediate = converted_value / self.scale_factor
+            return 1.0 / (intermediate + eps)
+        elif self.needs_inversion:
+            # converted_value = 1/original
+            return 1.0 / (converted_value + eps)
+        elif self.scale_factor != 1.0:
+            # converted_value = original * scale_factor
+            return converted_value / self.scale_factor
+        else:
+            return converted_value
 
 def align_depth_scale(pred, gt, method='median'):
     """
@@ -169,7 +262,9 @@ def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disp
         'spearman_corr': spearman_corr
     }
 
-def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth, proc_pred_depth, file_prefix, output_dir, pred_is_disparity=False, outputs_metric_depth=False, conversion_info=None):
+def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth, proc_pred_depth, 
+                                file_prefix, output_dir, model_characteristics: ModelOutputCharacteristics, 
+                                conversion_info=None):
     """
     Create a combined visualization comparing original and processed images with their depth predictions
     
@@ -181,9 +276,8 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
         proc_pred_depth: Predicted depth map from processed image
         file_prefix: Prefix for saved files
         output_dir: Directory to save visualizations
-        pred_is_disparity: Whether predictions are disparity maps or relative depth
-                         Note: disparity can be absolute disparity (1/depth) or 
-                         relative/normalized disparity (proportional to 1/depth)
+        model_characteristics: ModelOutputCharacteristics describing the model output
+        conversion_info: Information about unit conversion applied
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -226,26 +320,8 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
         pred_valid_values = np.concatenate(pred_valid_depths)
         pred_min_depth, pred_max_depth = np.percentile(pred_valid_values, [5, 95])
         
-        if pred_is_disparity:
-            # Case: outputs relative/normalized disparity (both ZoeDepth non-metric and DepthAnything)
-            # Convert disparity range to depth range for better understanding
-            pred_as_depth_max = 1.0 / (pred_min_depth + 1e-6)  # min disparity -> max depth
-            pred_as_depth_min = 1.0 / (pred_max_depth + 1e-6)  # max disparity -> min depth
-            
-            if outputs_metric_depth:
-                # This shouldn't happen, but handle it gracefully
-                pred_range_text = f"Pred Rel-Disparity: {pred_min_depth:.4f} - {pred_max_depth:.4f}\nAs Depth: {pred_as_depth_min:.4f} - {pred_as_depth_max:.4f} (meters)"
-            else:
-                # Both ZoeDepth (non-metric) and DepthAnything output relative disparity-like values
-                pred_range_text = f"Pred Rel-Disparity: {pred_min_depth:.4f} - {pred_max_depth:.4f}\nAs Depth: {pred_as_depth_min:.4f} - {pred_as_depth_max:.4f} (relative scale)"
-        else:
-            # Case: outputs depth (ZoeDepth metric mode)
-            if outputs_metric_depth:
-                # ZoeDepth case: outputs metric depth in meters
-                pred_range_text = f"Pred Depth: {pred_min_depth:.4f} - {pred_max_depth:.4f} (m)"
-            else:
-                # This shouldn't happen now, but handle it gracefully
-                pred_range_text = f"Pred Depth: {pred_min_depth:.4f} - {pred_max_depth:.4f} (relative scale)"
+        # Create range text based on model characteristics
+        pred_range_text = f"Pred {model_characteristics.display_name}: {pred_min_depth:.4f} - {pred_max_depth:.4f}"
         
         # 归一化预测深度
         if np.any(orig_pred_valid):
@@ -266,36 +342,19 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     gt_colored[~gt_valid, 3] = 0  # Set alpha=0 for invalid regions
     gt_rgb = gt_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
     
-    # Prediction visualization depends on whether prediction is disparity or relative depth
-    if pred_is_disparity:
-        # ZoeDepth case: prediction is disparity, use DIRECT mapping since disparity is already inverted relative to depth
-        # Disparity: high=near, low=far, and jet(high)=red, jet(low)=blue, so direct mapping gives near=red
-        orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
-        orig_pred_colored[orig_pred_valid] = cm_jet(orig_pred_viz[orig_pred_valid])  # Direct mapping for disparity
-        orig_pred_colored[~orig_pred_valid, 3] = 0
-        orig_pred_rgb = orig_pred_colored[:, :, :3]
-        
-        proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
-        proc_pred_colored[proc_pred_valid] = cm_jet(proc_pred_viz[proc_pred_valid])  # Direct mapping for disparity
-        proc_pred_colored[~proc_pred_valid, 3] = 0
-        proc_pred_rgb = proc_pred_colored[:, :, :3]
-        
-        pred_title_suffix = "Disparity→Depth View (Near=Red, Far=Blue)"
-    else:
-        # DepthAnything case: prediction is relative depth, use INVERTED mapping (same as GT)
-        orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
-        orig_pred_colored[orig_pred_valid] = cm_jet(1.0 - orig_pred_viz[orig_pred_valid])  # Invert mapping for depth
-        orig_pred_colored[~orig_pred_valid, 3] = 0
-        orig_pred_rgb = orig_pred_colored[:, :, :3]
-        
-        proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
-        proc_pred_colored[proc_pred_valid] = cm_jet(1.0 - proc_pred_viz[proc_pred_valid])  # Invert mapping for depth
-        proc_pred_colored[~proc_pred_valid, 3] = 0
-        proc_pred_rgb = proc_pred_colored[:, :, :3]
-        
-        pred_title_suffix = "Depth Prediction (Near=Red, Far=Blue)"
+    # Prediction visualization depends on whether prediction was originally disparity
+    # After processing, all predictions are in depth space, so use consistent mapping
+    orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
+    orig_pred_colored[orig_pred_valid] = cm_jet(1.0 - orig_pred_viz[orig_pred_valid])  # Invert mapping for depth
+    orig_pred_colored[~orig_pred_valid, 3] = 0
+    orig_pred_rgb = orig_pred_colored[:, :, :3]
+    
+    proc_pred_colored = np.zeros((*proc_pred_viz.shape, 4), dtype=np.float32)
+    proc_pred_colored[proc_pred_valid] = cm_jet(1.0 - proc_pred_viz[proc_pred_valid])  # Invert mapping for depth
     proc_pred_colored[~proc_pred_valid, 3] = 0
-    proc_pred_rgb = proc_pred_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
+    proc_pred_rgb = proc_pred_colored[:, :, :3]
+    
+    pred_title_suffix = "Depth Prediction (Near=Red, Far=Blue)"
     
     # Create comparison visualization with 2 rows, 3 columns
     plt.figure(figsize=(18, 12))
@@ -350,51 +409,30 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
                 
                 # Calculate display labels based on conversion info
                 if conversion_info and conversion_info.get('applied', False):
-                    # Unit conversion was applied (e.g., DepthAnything disparity->km->m)
-                    if conversion_info['original_unit'] == 'disparity->km':
-                        # DepthAnything: show original disparity and converted depth
-                        # To get original disparity: disparity = 1 / (depth_m / 1000)
-                        depth_km = pred_val / 1000.0  # Convert meters back to km
-                        original_disparity = 1.0 / (depth_km + 1e-6)  # Get original disparity
-                        raw_label = f'{original_disparity:.4f}(disp)'
-                        meter_label = f'\n→{pred_val:.4f}m'
-                    else:
-                        # Other conversions 
-                        original_val = pred_val / conversion_info['factor']  # Convert back to original units
-                        raw_label = f'{original_val:.4f}({conversion_info["original_unit"][:2]})'
-                        meter_label = f'\n→{pred_val:.4f}m'
-                elif outputs_metric_depth:
-                    # Already in meters (e.g., ZoeDepth metric)
-                    raw_label = f'{pred_val:.4f}m'
-                    meter_label = ''  # No need to show conversion, already in meters
+                    # Unit conversion was applied - show original and converted values
+                    original_val = model_characteristics.get_original_value_from_converted(pred_val)
+                    raw_label = f'{original_val:.4f}({model_characteristics.output_unit[:4]})'
+                    meter_label = f'\n→{pred_val:.4f}m'
+                elif model_characteristics.is_metric:
+                    # Already in target units (typically meters)
+                    raw_label = f'{pred_val:.4f}{model_characteristics.output_unit[:1]}'
+                    meter_label = ''  # No conversion needed
                 else:
-                    # Non-metric models without unit conversion (e.g., ZoeDepth non-metric)
-                    if pred_is_disparity:
-                        # Disparity-like values: convert 1/disparity to get rough depth
-                        meter_val = 1.0 / (pred_val + 1e-6) if pred_val > 0 else float('inf')
-                        raw_label = f'{pred_val:.4f}(disp-rel)'
-                        if meter_val != float('inf') and meter_val < 1000:  # Reasonable depth range
+                    # Non-metric models - show relative values with approximate conversion
+                    raw_label = f'{pred_val:.4f}(rel)'
+                    # For non-metric depth, try to estimate actual depth using GT scale
+                    if gt_valid_depths:
+                        gt_sample = gt_depth[gt_valid]
+                        pred_sample = orig_pred_depth[orig_pred_valid & gt_valid]
+                        if len(pred_sample) > 0 and len(gt_sample) > 0:
+                            # Rough scale estimation using median ratio
+                            scale = np.median(gt_sample) / np.median(pred_sample)
+                            meter_val = pred_val * scale
                             meter_label = f'\n≈{meter_val:.4f}m'
                         else:
-                            meter_label = '\n≈∞m'
-                    else:
-                        # Relative depth: need scale alignment with GT to get meters
-                        # For visualization, we'll use a rough estimation based on median scaling
-                        if gt_valid_depths:
-                            gt_sample = gt_depth[gt_valid]
-                            pred_sample = orig_pred_depth[orig_pred_valid & gt_valid]
-                            if len(pred_sample) > 0 and len(gt_sample) > 0:
-                                # Rough scale estimation using median ratio
-                                scale = np.median(gt_sample) / np.median(pred_sample)
-                                meter_val = pred_val * scale
-                                raw_label = f'{pred_val:.4f}(rel)'
-                                meter_label = f'\n≈{meter_val:.4f}m'
-                            else:
-                                raw_label = f'{pred_val:.4f}(rel)'
-                                meter_label = '\n≈?m'
-                        else:
-                            raw_label = f'{pred_val:.4f}(rel)'
                             meter_label = '\n≈?m'
+                    else:
+                        meter_label = '\n≈?m'
                 
                 # Combine raw and meter labels
                 full_label = raw_label + meter_label
@@ -424,51 +462,30 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
                 
                 # Calculate display labels based on conversion info  
                 if conversion_info and conversion_info.get('applied', False):
-                    # Unit conversion was applied (e.g., DepthAnything disparity->km->m)
-                    if conversion_info['original_unit'] == 'disparity->km':
-                        # DepthAnything: show original disparity and converted depth
-                        # To get original disparity: disparity = 1 / (depth_m / 1000)
-                        depth_km = pred_val / 1000.0  # Convert meters back to km
-                        original_disparity = 1.0 / (depth_km + 1e-6)  # Get original disparity
-                        raw_label = f'{original_disparity:.4f}(disp)'
-                        meter_label = f'\n→{pred_val:.4f}m'
-                    else:
-                        # Other conversions 
-                        original_val = pred_val / conversion_info['factor']  # Convert back to original units
-                        raw_label = f'{original_val:.4f}({conversion_info["original_unit"][:2]})'
-                        meter_label = f'\n→{pred_val:.4f}m'
-                elif outputs_metric_depth:
-                    # Already in meters (e.g., ZoeDepth metric)
-                    raw_label = f'{pred_val:.4f}m'
-                    meter_label = ''  # No need to show conversion, already in meters
+                    # Unit conversion was applied - show original and converted values
+                    original_val = model_characteristics.get_original_value_from_converted(pred_val)
+                    raw_label = f'{original_val:.4f}({model_characteristics.output_unit[:4]})'
+                    meter_label = f'\n→{pred_val:.4f}m'
+                elif model_characteristics.is_metric:
+                    # Already in target units (typically meters)
+                    raw_label = f'{pred_val:.4f}{model_characteristics.output_unit[:1]}'
+                    meter_label = ''  # No conversion needed
                 else:
-                    # Non-metric models without unit conversion (e.g., ZoeDepth non-metric)
-                    if pred_is_disparity:
-                        # Disparity-like values: convert 1/disparity to get rough depth
-                        meter_val = 1.0 / (pred_val + 1e-6) if pred_val > 0 else float('inf')
-                        raw_label = f'{pred_val:.4f}(disp-rel)'
-                        if meter_val != float('inf') and meter_val < 1000:  # Reasonable depth range
+                    # Non-metric models - show relative values with approximate conversion
+                    raw_label = f'{pred_val:.4f}(rel)'
+                    # For non-metric depth, try to estimate actual depth using GT scale
+                    if gt_valid_depths:
+                        gt_sample = gt_depth[gt_valid]
+                        pred_sample = proc_pred_depth[proc_pred_valid & gt_valid]
+                        if len(pred_sample) > 0 and len(gt_sample) > 0:
+                            # Rough scale estimation using median ratio
+                            scale = np.median(gt_sample) / np.median(pred_sample)
+                            meter_val = pred_val * scale
                             meter_label = f'\n≈{meter_val:.4f}m'
                         else:
-                            meter_label = '\n≈∞m'
-                    else:
-                        # Relative depth: need scale alignment with GT to get meters
-                        # For visualization, we'll use a rough estimation based on median scaling
-                        if gt_valid_depths:
-                            gt_sample = gt_depth[gt_valid]
-                            pred_sample = proc_pred_depth[proc_pred_valid & gt_valid]
-                            if len(pred_sample) > 0 and len(gt_sample) > 0:
-                                # Rough scale estimation using median ratio
-                                scale = np.median(gt_sample) / np.median(pred_sample)
-                                meter_val = pred_val * scale
-                                raw_label = f'{pred_val:.4f}(rel)'
-                                meter_label = f'\n≈{meter_val:.4f}m'
-                            else:
-                                raw_label = f'{pred_val:.4f}(rel)'
-                                meter_label = '\n≈?m'
-                        else:
-                            raw_label = f'{pred_val:.4f}(rel)'
                             meter_label = '\n≈?m'
+                    else:
+                        meter_label = '\n≈?m'
                 
                 # Combine raw and meter labels
                 full_label = raw_label + meter_label
@@ -499,11 +516,8 @@ def visualize_comparison_combined(orig_img, proc_img, gt_depth, orig_pred_depth,
     eps = 1e-6
     
     # Convert to depth domain (same logic as compute_depth_metrics)
-    if pred_is_disparity:
-        if np.any(valid_orig):
-            orig_pred_depth[valid_orig] = 1.0 / (orig_pred_depth[valid_orig] + eps)
-        if np.any(valid_proc):
-            proc_pred_depth[valid_proc] = 1.0 / (proc_pred_depth[valid_proc] + eps)
+    # After postprocessing, all predictions are in depth domain (meters)
+    # No additional conversion needed since model characteristics handle this
     
     # Apply scale alignment (same as in compute_depth_metrics)
     if np.any(valid_orig):
@@ -575,7 +589,7 @@ class ModelWrapper:
         self.model_type = model_type
         self.device = device
         self.model = None
-        self.outputs_metric_depth = False  # True for metric depth, False for relative depth/disparity
+        self.output_characteristics: Optional[ModelOutputCharacteristics] = None
         
         if model_type == 'depthanything':
             self._init_depthanything(**kwargs)
@@ -583,6 +597,10 @@ class ModelWrapper:
             self._init_zoedepth(**kwargs)
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
+        
+        # Ensure output_characteristics is set
+        if self.output_characteristics is None:
+            raise ValueError(f"Model initialization failed: output_characteristics not set for {model_type}")
     
     def _init_depthanything(self, encoder='vitl', checkpoint_dir='checkpoints', metric=False):
         """Initialize DepthAnything v2 model"""
@@ -598,7 +616,27 @@ class ModelWrapper:
         
         if metric:
             model_path = os.path.join(checkpoint_dir, f"depth_anything_v2_metric_vkitti_{encoder}.pth")
-            self.outputs_metric_depth = True
+            # Metric DepthAnything outputs metric depth
+            self.output_characteristics = ModelOutputCharacteristics(
+                is_disparity=False,
+                is_metric=True,
+                output_unit='meters',
+                target_unit='meters',
+                needs_inversion=False,
+                scale_factor=1.0,
+                display_name="Metric Depth (meters)"
+            )
+        else:
+            # Non-metric DepthAnything outputs disparity that converts to depth in kilometers
+            self.output_characteristics = ModelOutputCharacteristics(
+                is_disparity=True,
+                is_metric=False,
+                output_unit='disparity->km',
+                target_unit='meters',
+                needs_inversion=True,
+                scale_factor=1000.0,  # km -> meters
+                display_name="Relative Disparity (converts to km, then to m)"
+            )
         
         print(f"Loading DepthAnything v2 model from {model_path}")
         self.model.load_state_dict(torch.load(model_path, map_location='cpu'))
@@ -642,8 +680,17 @@ class ModelWrapper:
         self._patch_zoedepth_model()
         
         self.model = self.model.to(self.device).eval()
-        # ZoeDepth outputs metric depth in meters, same as GT
-        self.outputs_metric_depth = True  # ZoeDepth outputs metric depth
+        
+        # ZoeDepth outputs metric depth in meters
+        self.output_characteristics = ModelOutputCharacteristics(
+            is_disparity=False,
+            is_metric=True,
+            output_unit='meters',
+            target_unit='meters',
+            needs_inversion=False,
+            scale_factor=1.0,
+            display_name="Metric Depth (meters)"
+        )
         
     def _patch_zoedepth_model(self):
         """Apply compatibility patches for ZoeDepth"""
@@ -688,7 +735,7 @@ class ModelWrapper:
     
     def postprocess_prediction(self, pred_depth, gt_depth_shape):
         """
-        Post-process prediction based on model type
+        Post-process prediction based on model output characteristics
         
         Args:
             pred_depth: Raw prediction from model
@@ -696,55 +743,21 @@ class ModelWrapper:
             
         Returns:
             processed_depth: Processed depth for metrics calculation
-            display_depth: Depth for visualization (original values)
-            is_pred_disparity: Whether the processed prediction is disparity-like
+            display_depth: Depth for visualization
             conversion_info: Information about unit conversion applied
         """
         # Resize to match ground truth
         if pred_depth.shape != gt_depth_shape:
             pred_depth = resize(pred_depth, gt_depth_shape, order=1, preserve_range=True)
         
-        conversion_info = {'applied': False, 'factor': 1.0, 'original_unit': 'unknown', 'target_unit': 'meters'}
+        # Ensure output_characteristics is available
+        assert self.output_characteristics is not None, "Model output characteristics not initialized"
         
-        if self.outputs_metric_depth:
-            # This model outputs metric depth, keep as depth for metrics calculation
-            processed_depth = pred_depth  # Keep as metric depth
-            display_depth = pred_depth.copy()  # Keep as metric depth for consistent visualization
-            
-            # For metrics calculation: pred is depth (same as GT)
-            is_pred_disparity = False  # Pred is metric depth, not disparity
-            conversion_info.update({'original_unit': 'meters', 'target_unit': 'meters'})
-        else:
-            # Non-metric models: both DepthAnything and ZoeDepth output disparity-like values
-            if self.model_type == 'zoedepth':
-                # ZoeDepth: when not metric, outputs relative/normalized disparity
-                # (proportional to 1/depth but not absolute disparity = 1/depth)
-                processed_depth = pred_depth  # Keep as relative disparity
-                display_depth = pred_depth.copy()  # Keep as relative disparity for visualization
-                is_pred_disparity = True  # Pred is relative disparity
-                conversion_info.update({'original_unit': 'relative_disparity', 'target_unit': 'relative_disparity'})
-            else:
-                # DepthAnything: outputs disparity (inverse depth)
-                # When converted to depth via 1/disparity, the depth unit is kilometers
-                # Need to convert from kilometers to meters by multiplying by 1000
-                # Step 1: Convert disparity to depth (km): depth_km = 1/disparity
-                # Step 2: Convert depth from km to meters: depth_m = depth_km * 1000
-                # Combined: depth_m = (1/disparity) * 1000 = 1000/disparity
-                
-                # For metrics calculation: convert disparity to depth in meters
-                eps = 1e-6
-                depth_km = 1.0 / (pred_depth + eps)  # disparity -> depth in km
-                processed_depth = depth_km * 1000.0  # convert km to meters
-                display_depth = processed_depth.copy()  # depth in meters for visualization
-                is_pred_disparity = False  # After conversion, pred is now depth in meters
-                conversion_info.update({
-                    'applied': True, 
-                    'factor': 1000.0, 
-                    'original_unit': 'disparity->km', 
-                    'target_unit': 'meters'
-                })
+        # Convert using model characteristics
+        processed_depth, conversion_info = self.output_characteristics.convert_to_target_unit(pred_depth)
+        display_depth = processed_depth.copy()  # Use converted depth for consistent visualization
         
-        return processed_depth, display_depth, is_pred_disparity, conversion_info
+        return processed_depth, display_depth, conversion_info
 
 def validate_flsea(args):
     """
@@ -842,27 +855,30 @@ def validate_flsea(args):
             orig_pred_depth = model.predict(original_image, args.input_size)
             proc_pred_depth = model.predict(processed_image, args.input_size)
             
-            # Post-process predictions based on model type
-            orig_pred_processed, orig_pred_display, is_pred_disparity, orig_conversion_info = model.postprocess_prediction(orig_pred_depth, gt_depth.shape)
-            proc_pred_processed, proc_pred_display, _, proc_conversion_info = model.postprocess_prediction(proc_pred_depth, gt_depth.shape)
+            # Post-process predictions based on model output characteristics
+            orig_pred_processed, orig_pred_display, orig_conversion_info = model.postprocess_prediction(orig_pred_depth, gt_depth.shape)
+            proc_pred_processed, proc_pred_display, proc_conversion_info = model.postprocess_prediction(proc_pred_depth, gt_depth.shape)
+            
+            # Ensure model characteristics are available
+            assert model.output_characteristics is not None, "Model output characteristics not initialized"
             
             # Create combined visualization (using display depth for better visualization)
             visualize_comparison_combined(
                 original_image, processed_image, gt_depth, 
                 orig_pred_display, proc_pred_display,
-                basename, args.output_dir, pred_is_disparity=is_pred_disparity,
-                outputs_metric_depth=model.outputs_metric_depth,
+                basename, args.output_dir, 
+                model_characteristics=model.output_characteristics,
                 conversion_info=orig_conversion_info
             )
             
-            # Compute metrics: GT is now confirmed as depth, not disparity
+            # Compute metrics: GT is depth, prediction characteristics determine if conversion needed
             metrics_orig_sample = compute_depth_metrics(
                 orig_pred_processed, gt_depth, 
-                is_gt_disparity=False, is_pred_disparity=is_pred_disparity
+                is_gt_disparity=False, is_pred_disparity=model.output_characteristics.is_disparity
             )
             metrics_proc_sample = compute_depth_metrics(
                 proc_pred_processed, gt_depth, 
-                is_gt_disparity=False, is_pred_disparity=is_pred_disparity
+                is_gt_disparity=False, is_pred_disparity=model.output_characteristics.is_disparity
             )
             
             # Add to totals for metrics calculation
@@ -887,8 +903,11 @@ def validate_flsea(args):
         avg_metrics_proc = {k: v / valid_samples for k, v in metrics_proc.items()}
         
         # Print model information
+        assert model.output_characteristics is not None, "Model output characteristics not initialized"
         print(f"\nModel: {model_name}")
-        print(f"Outputs metric depth: {model.outputs_metric_depth}")
+        print(f"Model output: {model.output_characteristics.display_name}")
+        print(f"Is metric: {model.output_characteristics.is_metric}")
+        print(f"Is disparity: {model.output_characteristics.is_disparity}")
         
         # Print metrics in table format
         print("\n" + "="*90)
@@ -934,9 +953,16 @@ def validate_flsea(args):
         print("="*90)
         
         # Save overall metrics to a JSON file
+        assert model.output_characteristics is not None, "Model output characteristics not initialized"
         serializable_metrics = {
             'model': model_name,
-            'outputs_metric_depth': model.outputs_metric_depth,
+            'model_characteristics': {
+                'display_name': model.output_characteristics.display_name,
+                'is_metric': model.output_characteristics.is_metric,
+                'is_disparity': model.output_characteristics.is_disparity,
+                'output_unit': model.output_characteristics.output_unit,
+                'target_unit': model.output_characteristics.target_unit
+            },
             'original': {k: float(v) for k, v in avg_metrics_orig.items()},
             'processed': {k: float(v) for k, v in avg_metrics_proc.items()}
         }
