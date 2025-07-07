@@ -17,8 +17,10 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import warnings
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import random
+from io import BytesIO
+import PIL.Image
 
 # Import model wrapper and characteristics
 from models import create_model, get_model_name, ModelOutputCharacteristics
@@ -167,7 +169,8 @@ class MultiModelComparison:
         
         return results
     
-    def create_comparison_visualization(self, results: Dict, output_path: str = "model_comparison.png"):
+    def create_comparison_visualization(self, results: Dict, output_path: str = "model_comparison.png", 
+                                      max_rows_in_final: Optional[int] = None):
         """Create comprehensive comparison visualization with 5 columns layout"""
         samples = results['samples']
         predictions = results['predictions']
@@ -182,15 +185,17 @@ class MultiModelComparison:
         
         # Create figure: columns = [Original, GT, Model1, Model2, Model3]
         n_cols = 2 + n_models  # Original + GT + models
-        fig_width = n_cols * 4
-        fig_height = n_samples * 3
-        
-        fig = plt.figure(figsize=(fig_width, fig_height))
-        
-        # Column headers
         col_headers = ['Original Image', 'Ground Truth'] + model_names
         
         print(f"Creating visualization with {n_samples} samples and {n_models} models...")
+        
+        # Create output directory for individual rows
+        output_dir = os.path.dirname(output_path)
+        rows_dir = os.path.join(output_dir, "individual_rows")
+        os.makedirs(rows_dir, exist_ok=True)
+        
+        # Store row images for final concatenation
+        row_images = []
         
         for row in range(n_samples):
             sample = samples[row]
@@ -198,32 +203,46 @@ class MultiModelComparison:
             gt_depth = sample['gt_depth']
             basename = sample['basename']
             
-            # Prepare depth visualizations following test.py approach
+            # Prepare depth visualizations
             gt_viz, pred_vizs, range_texts = self._prepare_depths_for_visualization(
                 gt_depth, samples, predictions, model_names, row
             )
             
+            # Create single row figure
+            fig_width = n_cols * 4
+            fig_height = 4.5 if row == 0 else 4  # First row slightly taller for titles
+            
+            fig, axes = plt.subplots(1, n_cols, figsize=(fig_width, fig_height))
+            if n_cols == 1:
+                axes = [axes]
+            
+            # Set tight layout with no spacing
+            plt.subplots_adjust(left=0, right=1, top=0.85 if row == 0 else 1, bottom=0, wspace=0)
+            
             for col in range(n_cols):
-                subplot_idx = row * n_cols + col + 1
-                ax = plt.subplot(n_samples, n_cols, subplot_idx)
+                ax = axes[col]
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+                ax.axis('off')
                 
                 if col == 0:  # Original image
-                    # Convert BGR to RGB for display
                     img_rgb = cv2.cvtColor(original_image.astype(np.uint8), cv2.COLOR_BGR2RGB)
-                    plt.imshow(img_rgb)
+                    ax.imshow(img_rgb)
                     if row == 0:
-                        plt.title(col_headers[col], fontsize=14, fontweight='bold')
-                    plt.ylabel(f"Sample {row+1}\n{basename}", fontsize=10, rotation=0, ha='right', va='center')
+                        ax.set_title(col_headers[col], fontsize=14, fontweight='bold')
+                    ax.set_ylabel(f"Sample {row+1}\n{basename}", fontsize=10, rotation=0, ha='right', va='center')
                     
                 elif col == 1:  # Ground truth
-                    plt.imshow(gt_viz)  # gt_viz is now RGB image
+                    ax.imshow(gt_viz)
                     if row == 0:
-                        plt.title(col_headers[col], fontsize=14, fontweight='bold')
+                        ax.set_title(col_headers[col], fontsize=14, fontweight='bold')
                     
                     # Add depth range annotation
                     gt_valid = ~np.isnan(gt_depth) & ~np.isinf(gt_depth) & (gt_depth > 0)
                     if np.any(gt_valid):
-                        plt.text(0.02, 0.98, range_texts['gt'], 
+                        ax.text(0.02, 0.98, range_texts['gt'], 
                                transform=ax.transAxes, fontsize=8, 
                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
                                verticalalignment='top')
@@ -245,15 +264,15 @@ class MultiModelComparison:
                         conversion_info = pred_data['conversion_info']
                         
                         # Show prediction visualization
-                        plt.imshow(pred_vizs[model_name])  # pred_vizs are now RGB images
+                        ax.imshow(pred_vizs[model_name])
                         
                         if row == 0:
                             title = f"{model_name}\n({model_chars.display_name})"
-                            plt.title(title, fontsize=12, fontweight='bold')
+                            ax.set_title(title, fontsize=12, fontweight='bold')
                         
                         # Add range annotation
                         if model_name in range_texts:
-                            plt.text(0.02, 0.98, range_texts[model_name], 
+                            ax.text(0.02, 0.98, range_texts[model_name], 
                                    transform=ax.transAxes, fontsize=7,
                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
                                    verticalalignment='top')
@@ -267,18 +286,49 @@ class MultiModelComparison:
                                               conversion_info, gt_valid_depths, gt_depth, gt_valid)
                     else:
                         # No prediction available
-                        plt.text(0.5, 0.5, 'No Prediction', ha='center', va='center', 
+                        ax.text(0.5, 0.5, 'No Prediction', ha='center', va='center', 
                                transform=ax.transAxes, fontsize=12, color='red')
                         if row == 0:
-                            plt.title(model_names[model_idx], fontsize=12, fontweight='bold')
-                
-                plt.axis('off')
+                            ax.set_title(model_names[model_idx], fontsize=12, fontweight='bold')
+            
+            # Save individual row
+            row_filename = f"row_{row+1:02d}_{basename}.png"
+            row_path = os.path.join(rows_dir, row_filename)
+            plt.savefig(row_path, dpi=300, bbox_inches='tight', pad_inches=0)
+            print(f"  Saved row {row+1}: {row_filename}")
+            
+            # Save row to memory as image array for concatenation
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=300, bbox_inches='tight', pad_inches=0)
+            buf.seek(0)
+            
+            # Read back as image array
+            row_img = PIL.Image.open(buf)
+            row_images.append(np.array(row_img))
+            
+            plt.close()
+            buf.close()
         
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        plt.close()
+        # Determine how many rows to include in final image
+        if max_rows_in_final is None:
+            max_rows_in_final = min(5, n_samples)  # Default to 5 or less
         
-        print(f"✅ Comparison visualization saved to: {output_path}")
+        rows_to_include = min(max_rows_in_final, len(row_images))
+        
+        # Concatenate selected rows vertically
+        print(f"Concatenating first {rows_to_include} rows into final image...")
+        if rows_to_include > 0:
+            final_image = np.vstack(row_images[:rows_to_include])
+            
+            # Save final concatenated image
+            final_pil = PIL.Image.fromarray(final_image)
+            final_pil.save(output_path, dpi=(300, 300))
+            
+            print(f"✅ Final comparison visualization saved to: {output_path}")
+            print(f"📁 Individual rows saved to: {rows_dir}")
+            print(f"📊 Final image contains {rows_to_include} rows out of {n_samples} total samples")
+        else:
+            print("❌ No rows to concatenate")
     
     def _prepare_depths_for_visualization(self, gt_depth, samples, predictions, model_names, current_row):
         """Prepare depth visualizations with individual normalization for each depth map"""
@@ -405,7 +455,7 @@ class MultiModelComparison:
                     # For GT, simple meter label
                     full_label = f'{depth_val:.3f}m'
                 
-                plt.annotate(full_label, 
+                ax.annotate(full_label, 
                            xy=(x_center, y_pos), 
                            xytext=(x_center + w//8, y_pos),
                            fontsize=6, color='white', weight='bold',
@@ -497,8 +547,10 @@ def main():
     parser = argparse.ArgumentParser(description='Multi-Model Depth Estimation Comparison')
     parser.add_argument('--data-root', type=str, default='assets/FLSea/red_sea/pier_path',
                        help='Path to dataset')
-    parser.add_argument('--num-samples', type=int, default=5,
+    parser.add_argument('--num-samples', type=int, default=20,
                        help='Number of samples to compare')
+    parser.add_argument('--max-rows-final', type=int, default=4,
+                       help='Maximum rows to include in final concatenated image')
     parser.add_argument('--output-dir', type=str, default='visualizations/comparison',
                        help='Output directory for comparison results')
     parser.add_argument('--random-seed', type=int, default=42,
@@ -527,7 +579,7 @@ def main():
         # Create visualization
         print("\n🎨 Creating comparison visualization...")
         output_path = os.path.join(args.output_dir, "model_comparison.png")
-        comparison.create_comparison_visualization(results, output_path)
+        comparison.create_comparison_visualization(results, output_path, args.max_rows_final)
         
         # Compute and print metrics
         print("\n📈 Computing evaluation metrics...")
