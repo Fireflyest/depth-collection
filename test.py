@@ -4,15 +4,18 @@
 """
 Unified Dataset Validation Script
 Evaluates model performance on various depth estimation datasets with optional image enhancement
-Supports multiple depth estimation models: DepthAnything v2 and ZoeDepth
+Supports multiple depth estimation models: DepthAnything v2, ZoeDepth, and VGGT
 Supports multiple dataset types: FLSea (with SeaErra enhancement), Standard depth datasets
 
 Usage:
     # For DepthAnything v2
-    python flsea_val.py --model-type depthanything --encoder vitl --dataset-type standard --data-root assets/FLSea/red_sea/pier_path --num-samples 10
+    python test.py --model-type depthanything --encoder vitl --dataset-type standard --data-root assets/FLSea/red_sea/pier_path --num-samples 10
     
     # For ZoeDepth
-    python flsea_val.py --model-type zoedepth --zoedepth-type N --dataset-type standard --data-root assets/FLSea/red_sea/pier_path --num-samples 10
+    python test.py --model-type zoedepth --zoedepth-type N --dataset-type standard --data-root assets/FLSea/red_sea/pier_path --num-samples 10
+    
+    # For VGGT
+    python test.py --model-type vggt --dataset-type standard --data-root assets/FLSea/red_sea/pier_path --num-samples 10
 """
 
 import os
@@ -33,140 +36,20 @@ from models import create_model, get_model_name, ModelOutputCharacteristics
 # Import dataset base classes
 from dataset_base import create_dataset, get_available_datasets
 
+# Import depth processing utilities
+from depth_utils import (
+    align_depth_scale, 
+    compute_depth_metrics, 
+    format_depth_label, 
+    prepare_depth_visualization,
+    create_depth_range_text,
+    extract_depth_maps,
+    create_robust_valid_mask
+)
+
 # Suppress warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
-
-def align_depth_scale(pred, gt, method='median'):
-    """
-    Align the scale of predicted depth to ground truth depth
-    
-    Args:
-        pred: predicted depth map
-        gt: ground truth depth map
-        method: alignment method ('median', 'mean', 'least_squares')
-    
-    Returns:
-        scale factor and aligned prediction
-    """
-    eps = 1e-6
-    
-    if method == 'median':
-        scale = np.median(gt) / (np.median(pred) + eps)
-    elif method == 'mean':
-        scale = np.mean(gt) / (np.mean(pred) + eps)
-    elif method == 'least_squares':
-        # Least squares scale alignment: minimize ||s*pred - gt||^2
-        scale = np.sum(pred * gt) / (np.sum(pred * pred) + eps)
-    else:
-        raise ValueError(f"Unknown alignment method: {method}")
-    
-    return scale, pred * scale
-
-def compute_depth_metrics(pred, gt, mask=None, align_method='median', is_gt_disparity=True, is_pred_disparity=False):
-    """
-    Compute depth evaluation metrics for relative depth estimation
-    
-    Args:
-        pred: predicted depth/disparity map
-        gt: ground truth map (disparity or depth)
-        mask: optional mask for valid pixels
-        align_method: method for scale alignment ('median', 'mean', 'least_squares')
-        is_gt_disparity: whether the ground truth is a disparity map (inverse depth)
-        is_pred_disparity: whether the prediction is a disparity map (inverse depth)
-                          Note: For non-metric models, this includes:
-                          - Absolute disparity (1/depth with known scale)
-                          - Relative/normalized disparity (inverse proportional to depth)
-                          - Other inverse-depth-like representations
-        
-    Returns:
-        Dictionary of metrics
-    """
-    # Convert to numpy arrays if they are tensors
-    if isinstance(pred, torch.Tensor):
-        pred = pred.squeeze().cpu().numpy()
-    if isinstance(gt, torch.Tensor):
-        gt = gt.squeeze().cpu().numpy()
-    if mask is not None and isinstance(mask, torch.Tensor):
-        mask = mask.squeeze().cpu().numpy().astype(bool)
-    
-    # Create valid value masks - exclude zeros, nan, and negative values
-    if mask is None:
-        mask = np.ones_like(gt, dtype=bool)
-    
-    valid_mask = (gt > 0) & (pred > 0) & np.isfinite(gt) & np.isfinite(pred) & mask
-    
-    # Apply valid mask
-    if valid_mask.sum() == 0:
-        # Return zeros if no valid pixels
-        return {
-            'scale_factor': 0,
-            'rmse': 0, 'rmse_log': 0, 'abs_rel': 0, 'sq_rel': 0,
-            'delta1': 0, 'delta2': 0, 'delta3': 0, 'log10': 0,
-            'silog': 0, 'pearson_corr': 0, 'spearman_corr': 0
-        }
-        
-    pred = pred[valid_mask]
-    gt = gt[valid_mask].copy()  # Make a copy to avoid modifying the original
-    
-    # Avoid division by zero
-    eps = 1e-6
-    
-    # Convert to same domain for fair comparison
-    # Strategy: Convert everything to depth domain for metrics calculation
-    if is_gt_disparity:
-        gt = 1.0 / (gt + eps)  # GT: disparity → depth
-    
-    if is_pred_disparity:
-        pred = 1.0 / (pred + eps)  # Pred: disparity → depth
-    
-    # Now both pred and gt are in depth domain (near=small, far=large)
-    
-    # Align scale - critical for comparing relative depth with metric depth
-    scale_factor, pred_aligned = align_depth_scale(pred, gt, method=align_method)
-    
-    # Threshold accuracy metrics: δ < 1.25^n (scale-invariant)
-    thresh = np.maximum((gt / (pred_aligned + eps)), ((pred_aligned + eps) / (gt + eps)))
-    delta1 = (thresh < 1.25).mean()
-    delta2 = (thresh < 1.25 ** 2).mean()
-    delta3 = (thresh < 1.25 ** 3).mean()
-    
-    # Error metrics (after scale alignment)
-    rmse = np.sqrt(((gt - pred_aligned) ** 2).mean())
-    rmse_log = np.sqrt(((np.log(gt + eps) - np.log(pred_aligned + eps)) ** 2).mean())
-    abs_rel = np.mean(np.abs(gt - pred_aligned) / (gt + eps))
-    sq_rel = np.mean(((gt - pred_aligned) ** 2) / (gt + eps))
-    
-    # Log accuracy
-    log10 = np.mean(np.abs(np.log10(gt + eps) - np.log10(pred_aligned + eps)))
-    
-    # Scale-invariant log error (SILog) - important for relative depth
-    log_diff = np.log(pred_aligned + eps) - np.log(gt + eps)
-    silog = np.sqrt(np.mean(log_diff ** 2) - (np.mean(log_diff) ** 2)) * 100
-    
-    # Correlation metrics (should use aligned values for fair comparison)
-    from scipy.stats import pearsonr, spearmanr
-    try:
-        pearson_corr, _ = pearsonr(pred_aligned.flatten(), gt.flatten())
-        spearman_corr, _ = spearmanr(pred_aligned.flatten(), gt.flatten())
-    except:
-        pearson_corr = 0
-        spearman_corr = 0
-    
-    return {
-        'scale_factor': scale_factor,
-        'rmse': rmse,
-        'rmse_log': rmse_log,
-        'abs_rel': abs_rel,
-        'sq_rel': sq_rel,
-        'delta1': delta1,
-        'delta2': delta2,
-        'delta3': delta3,
-        'log10': log10,
-        'silog': silog,
-        'pearson_corr': pearson_corr,
-        'spearman_corr': spearman_corr
-    }
 
 def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_depth, enhanced_pred_depth, 
                                 file_prefix, output_dir, model_characteristics: ModelOutputCharacteristics, 
@@ -196,10 +79,10 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
     orig_pred_viz = np.zeros_like(orig_pred_depth, dtype=np.float32)
     enhanced_pred_viz = np.zeros_like(enhanced_pred_depth, dtype=np.float32)
     
-    # Create masks for valid pixels
-    gt_valid = ~np.isnan(gt_depth) & ~np.isinf(gt_depth) & (gt_depth > 0)
-    orig_pred_valid = ~np.isnan(orig_pred_depth) & ~np.isinf(orig_pred_depth) & (orig_pred_depth > 0)
-    enhanced_pred_valid = ~np.isnan(enhanced_pred_depth) & ~np.isinf(enhanced_pred_depth) & (enhanced_pred_depth > 0)
+    # Create robust masks for valid pixels that filter out extreme values
+    gt_valid = create_robust_valid_mask(gt_depth)
+    orig_pred_valid = create_robust_valid_mask(orig_pred_depth)
+    enhanced_pred_valid = create_robust_valid_mask(enhanced_pred_depth)
     
     # Create a combined mask of valid pixels across all depth maps for consistent normalization
     gt_valid_depths = []
@@ -285,36 +168,37 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
         plt.imshow(gt_rgb)
         plt.title(f'Ground Truth Depth (Near=Red, Far=Blue)\n{gt_range_text}')
     else:
-        # 2x2 layout for single image analysis
-        plt.figure(figsize=(12, 10))
+        # 4x1 layout for single image analysis (4 rows, 1 column)
+        plt.figure(figsize=(10, 20))
         
-        # First row: Input image and ground truth
-        plt.subplot(2, 2, 1)
+        # First row: Input image
+        plt.subplot(4, 1, 1)
         plt.imshow(cv2.cvtColor(orig_img.astype(np.uint8), cv2.COLOR_BGR2RGB))
         plt.title('Input Image')
         plt.axis('off')
         
-        plt.subplot(2, 2, 2)
+        # Second row: Ground truth depth
+        plt.subplot(4, 1, 2)
         plt.imshow(gt_rgb)
         plt.title(f'Ground Truth Depth (Near=Red, Far=Blue)\n{gt_range_text}')
-    
-    # Add depth scale markers for GT (now confirmed as depth values)
-    if gt_valid_depths:
-        h, w = gt_depth.shape
-        x_center = w // 2
-        y_positions = [h // 6, h // 2, 5 * h // 6]  # top, middle, bottom
         
-        for y_pos in y_positions:
-            if gt_valid[y_pos, x_center]:
-                depth_val = gt_depth[y_pos, x_center]
-                plt.annotate(f'{depth_val:.4f}m', 
-                           xy=(x_center, y_pos), 
-                           xytext=(x_center + w//8, y_pos),
-                           fontsize=8, color='white', weight='bold',
-                           bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8),
-                           arrowprops=dict(arrowstyle='->', color='white', lw=1))
-    
-    plt.axis('off')
+        # Add depth scale markers for GT (now confirmed as depth values)
+        if gt_valid_depths:
+            h, w = gt_depth.shape
+            x_center = w // 2
+            y_positions = [h // 6, h // 2, 5 * h // 6]  # top, middle, bottom
+            
+            for y_pos in y_positions:
+                if gt_valid[y_pos, x_center]:
+                    depth_val = gt_depth[y_pos, x_center]
+                    plt.annotate(f'{depth_val:.4f}m', 
+                               xy=(x_center, y_pos), 
+                               xytext=(x_center + w//8, y_pos),
+                               fontsize=8, color='white', weight='bold',
+                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8),
+                               arrowprops=dict(arrowstyle='->', color='white', lw=1))
+        
+        plt.axis('off')
     
     # Second row: Depth predictions and error maps
     if has_enhancement:
@@ -332,7 +216,7 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
             for y_pos in y_positions:
                 if orig_pred_valid[y_pos, x_center]:
                     pred_val = orig_pred_depth[y_pos, x_center]
-                    full_label = _format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, orig_pred_depth, orig_pred_valid, gt_valid)
+                    full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, orig_pred_depth, orig_pred_valid, gt_valid)
                     
                     plt.annotate(full_label, 
                                xy=(x_center, y_pos), 
@@ -356,7 +240,7 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
             for y_pos in y_positions:
                 if enhanced_pred_valid[y_pos, x_center]:
                     pred_val = enhanced_pred_depth[y_pos, x_center]
-                    full_label = _format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, enhanced_pred_depth, enhanced_pred_valid, gt_valid)
+                    full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, enhanced_pred_depth, enhanced_pred_valid, gt_valid)
                     
                     plt.annotate(full_label, 
                                xy=(x_center, y_pos), 
@@ -371,8 +255,8 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
         plt.subplot(2, 3, 6)
         _plot_error_comparison(gt_depth, orig_pred_depth, enhanced_pred_depth, gt_valid, orig_pred_valid, enhanced_pred_valid, "Enhanced")
     else:
-        # Show single prediction and error analysis
-        plt.subplot(2, 2, 3)
+        # 4x1 layout: Third row - Predicted depth
+        plt.subplot(4, 1, 3)
         plt.imshow(orig_pred_rgb)
         plt.title(f'Predicted {pred_title_suffix}\n{pred_range_text}')
         
@@ -385,7 +269,7 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
             for y_pos in y_positions:
                 if orig_pred_valid[y_pos, x_center]:
                     pred_val = orig_pred_depth[y_pos, x_center]
-                    full_label = _format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, orig_pred_depth, orig_pred_valid, gt_valid)
+                    full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, orig_pred_depth, orig_pred_valid, gt_valid)
                     
                     plt.annotate(full_label, 
                                xy=(x_center, y_pos), 
@@ -396,8 +280,8 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
         
         plt.axis('off')
         
-        # Single error analysis
-        plt.subplot(2, 2, 4)
+        # 4x1 layout: Fourth row - Error analysis
+        plt.subplot(4, 1, 4)
         _plot_single_error_analysis(gt_depth, orig_pred_depth, gt_valid, orig_pred_valid)
     
     plt.tight_layout()
@@ -441,6 +325,14 @@ def validate_dataset(args):
             checkpoint_dir=args.checkpoint_dir
         )
         model_name = get_model_name('zoedepth', zoedepth_type=args.zoedepth_type)
+    elif args.model_type == 'vggt':
+        model = create_model(
+            model_type='vggt',
+            device=device,
+            checkpoint_dir=args.checkpoint_dir,
+            multi_image_mode=args.vggt_multi_image
+        )
+        model_name = get_model_name('vggt', multi_image_mode=args.vggt_multi_image)
     else:
         raise ValueError(f"Unsupported model type: {args.model_type}")
     
@@ -487,74 +379,179 @@ def validate_dataset(args):
     valid_samples = 0
     
     print(f"Starting validation on {len(indices)} samples...")
-    for idx in tqdm(indices):
-        try:
-            # Load sample from dataset
-            sample = dataset[idx]
-            
-            # Extract data
-            original_image = sample['original_image']
-            enhanced_image = sample['enhanced_image']  # May be None for datasets without enhancement
-            gt_depth = sample['depth']
-            enhanced_image_path = sample['enhanced_image_path']  # May be None
-            basename = sample['basename']
-            
-            # For datasets without enhancement, use original image as "processed" image
-            if enhanced_image is None:
-                enhanced_image = original_image.copy()
-                enhanced_image_path = f"original_{basename}"
-            
-            # Extract basename for output file
-            if enhanced_image_path:
-                file_basename = os.path.splitext(os.path.basename(enhanced_image_path))[0]
-            else:
-                file_basename = basename
-            
-            if original_image is None or enhanced_image is None or gt_depth is None:
-                print(f"Invalid sample at index {idx}")
-                continue
-            
-            # Run inference on both original and enhanced images
-            orig_pred_depth = model.predict(original_image, args.input_size)
-            proc_pred_depth = model.predict(enhanced_image, args.input_size)
-            
-            # Post-process predictions based on model output characteristics
-            orig_pred_processed, orig_pred_display, orig_conversion_info = model.postprocess_prediction(orig_pred_depth, gt_depth.shape)
-            proc_pred_processed, proc_pred_display, proc_conversion_info = model.postprocess_prediction(proc_pred_depth, gt_depth.shape)
-            
-            # Ensure model characteristics are available
-            assert model.output_characteristics is not None, "Model output characteristics not initialized"
-            
-            # Create combined visualization (using display depth for better visualization)
-            visualize_comparison_combined(
-                original_image, enhanced_image, gt_depth, 
-                orig_pred_display, proc_pred_display,
-                file_basename, args.output_dir, 
-                model_characteristics=model.output_characteristics,
-                conversion_info=orig_conversion_info
-            )
-            
-            # Compute metrics: GT is depth, pred is depth (already processed by postprocess_prediction)
-            # Note: After postprocess_prediction, predictions are always in depth domain (meters)
-            metrics_orig_sample = compute_depth_metrics(
-                orig_pred_processed, gt_depth, 
-                is_gt_disparity=False, is_pred_disparity=False
-            )
-            metrics_proc_sample = compute_depth_metrics(
-                proc_pred_processed, gt_depth, 
-                is_gt_disparity=False, is_pred_disparity=False
-            )
-            
-            # Add to totals for metrics calculation
-            for k, v in metrics_orig_sample.items():
-                metrics_orig[k] += v
-            for k, v in metrics_proc_sample.items():
-                metrics_proc[k] += v
-            
-            valid_samples += 1
+    
+    # Special handling for VGGT multi-image mode
+    if args.model_type == 'vggt' and args.vggt_multi_image:
+        # VGGT multi-image mode: process multiple images together
+        sequence_length = min(args.vggt_sequence_length, len(indices))
         
+        # Load all samples for multi-image processing
+        all_samples = []
+        original_images = []
+        enhanced_images = []
+        gt_depths = []
+        basenames = []
+        
+        print(f"VGGT multi-image mode: loading {sequence_length} images for batch processing...")
+        
+        for i, idx in enumerate(indices[:sequence_length]):
+            try:
+                sample = dataset[idx]
+                original_image = sample['original_image']
+                enhanced_image = sample['enhanced_image']
+                gt_depth = sample['depth']
+                basename = sample['basename']
+                
+                # For datasets without enhancement, use original image as "processed" image
+                if enhanced_image is None:
+                    enhanced_image = original_image.copy()
+                
+                if original_image is None or enhanced_image is None or gt_depth is None:
+                    print(f"Invalid sample at index {idx}")
+                    continue
+                
+                all_samples.append(sample)
+                original_images.append(original_image)
+                enhanced_images.append(enhanced_image)
+                gt_depths.append(gt_depth)
+                basenames.append(basename)
+                
+            except Exception as e:
+                print(f"Error loading sample at index {idx}: {e}")
+        
+        if len(original_images) == 0:
+            print("No valid samples loaded for VGGT multi-image processing")
+            return
+        
+        print(f"Loaded {len(original_images)} valid samples for VGGT multi-image processing")
+        
+        # Run VGGT multi-image inference
+        try:
+            orig_results = model.predict(original_images, args.input_size)
+            proc_results = model.predict(enhanced_images, args.input_size)
+            
+            # Extract and normalize depth maps from results
+            orig_depth_maps = extract_depth_maps(orig_results)
+            proc_depth_maps = extract_depth_maps(proc_results)
+            
+            # Process each image result
+            for i, (original_image, enhanced_image, gt_depth, basename) in enumerate(zip(original_images, enhanced_images, gt_depths, basenames)):
+                if i >= len(orig_depth_maps) or i >= len(proc_depth_maps):
+                    print(f"Missing depth prediction for sample {i}")
+                    continue
+                
+                orig_pred_depth = orig_depth_maps[i]
+                proc_pred_depth = proc_depth_maps[i]
+                
+                # Post-process predictions based on model output characteristics
+                orig_pred_processed, orig_pred_display, orig_conversion_info = model.postprocess_prediction(orig_pred_depth, gt_depth.shape)
+                proc_pred_processed, proc_pred_display, proc_conversion_info = model.postprocess_prediction(proc_pred_depth, gt_depth.shape)
+                
+                # Ensure model characteristics are available
+                assert model.output_characteristics is not None, "Model output characteristics not initialized"
+                
+                # Create combined visualization (using display depth for better visualization)
+                visualize_comparison_combined(
+                    original_image, enhanced_image, gt_depth, 
+                    orig_pred_display, proc_pred_display,
+                    f"multi_{i}_{basename}", args.output_dir, 
+                    model_characteristics=model.output_characteristics,
+                    conversion_info=orig_conversion_info
+                )
+                
+                # Compute metrics: GT is depth, pred is depth (already processed by postprocess_prediction)
+                # Note: After postprocess_prediction, predictions are always in depth domain (meters)
+                metrics_orig_sample = compute_depth_metrics(
+                    orig_pred_processed, gt_depth, 
+                    is_gt_disparity=False, is_pred_disparity=False
+                )
+                metrics_proc_sample = compute_depth_metrics(
+                    proc_pred_processed, gt_depth, 
+                    is_gt_disparity=False, is_pred_disparity=False
+                )
+                
+                # Add to totals for metrics calculation
+                for k, v in metrics_orig_sample.items():
+                    metrics_orig[k] += v
+                for k, v in metrics_proc_sample.items():
+                    metrics_proc[k] += v
+                
+                valid_samples += 1
+            
         except Exception as e:
-            print(f"Error processing sample at index {idx}: {e}")
+            print(f"Error in VGGT multi-image inference: {e}")
+            return
+    
+    else:
+        # Standard single-image processing for other models or VGGT single-image mode
+        for idx in tqdm(indices):
+            try:
+                # Load sample from dataset
+                sample = dataset[idx]
+                
+                # Extract data
+                original_image = sample['original_image']
+                enhanced_image = sample['enhanced_image']  # May be None for datasets without enhancement
+                gt_depth = sample['depth']
+                enhanced_image_path = sample['enhanced_image_path']  # May be None
+                basename = sample['basename']
+                
+                # For datasets without enhancement, use original image as "processed" image
+                if enhanced_image is None:
+                    enhanced_image = original_image.copy()
+                    enhanced_image_path = f"original_{basename}"
+                
+                # Extract basename for output file
+                if enhanced_image_path:
+                    file_basename = os.path.splitext(os.path.basename(enhanced_image_path))[0]
+                else:
+                    file_basename = basename
+                
+                if original_image is None or enhanced_image is None or gt_depth is None:
+                    print(f"Invalid sample at index {idx}")
+                    continue
+                
+                # Run inference on both original and enhanced images
+                orig_pred_depth = model.predict(original_image, args.input_size)
+                proc_pred_depth = model.predict(enhanced_image, args.input_size)
+                
+                # Post-process predictions based on model output characteristics
+                orig_pred_processed, orig_pred_display, orig_conversion_info = model.postprocess_prediction(orig_pred_depth, gt_depth.shape)
+                proc_pred_processed, proc_pred_display, proc_conversion_info = model.postprocess_prediction(proc_pred_depth, gt_depth.shape)
+                
+                # Ensure model characteristics are available
+                assert model.output_characteristics is not None, "Model output characteristics not initialized"
+                
+                # Create combined visualization (using display depth for better visualization)
+                visualize_comparison_combined(
+                    original_image, enhanced_image, gt_depth, 
+                    orig_pred_display, proc_pred_display,
+                    file_basename, args.output_dir, 
+                    model_characteristics=model.output_characteristics,
+                    conversion_info=orig_conversion_info
+                )
+                
+                # Compute metrics: GT is depth, pred is depth (already processed by postprocess_prediction)
+                # Note: After postprocess_prediction, predictions are always in depth domain (meters)
+                metrics_orig_sample = compute_depth_metrics(
+                    orig_pred_processed, gt_depth, 
+                    is_gt_disparity=False, is_pred_disparity=False
+                )
+                metrics_proc_sample = compute_depth_metrics(
+                    proc_pred_processed, gt_depth, 
+                    is_gt_disparity=False, is_pred_disparity=False
+                )
+                
+                # Add to totals for metrics calculation
+                for k, v in metrics_orig_sample.items():
+                    metrics_orig[k] += v
+                for k, v in metrics_proc_sample.items():
+                    metrics_proc[k] += v
+                
+                valid_samples += 1
+            
+            except Exception as e:
+                print(f"Error processing sample at index {idx}: {e}")
     
     # Calculate average metrics
     print(f"\nProcessed {valid_samples} valid samples")
@@ -635,38 +632,6 @@ def validate_dataset(args):
             json.dump(serializable_metrics, f, indent=4)
     else:
         print("No valid samples processed.")
-
-def _format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, pred_depth, pred_valid, gt_valid):
-    """Format depth label for visualization."""
-    # Calculate display labels based on conversion info
-    if conversion_info and conversion_info.get('applied', False):
-        # Unit conversion was applied - show original and converted values
-        original_val = model_characteristics.get_original_value_from_converted(pred_val)
-        raw_label = f'{original_val:.4f}({model_characteristics.output_unit[:4]})'
-        meter_label = f'\n→{pred_val:.4f}m'
-    elif model_characteristics.is_metric:
-        # Already in target units (typically meters)
-        raw_label = f'{pred_val:.4f}{model_characteristics.output_unit[:1]}'
-        meter_label = ''  # No conversion needed
-    else:
-        # Non-metric models - show relative values with approximate conversion
-        raw_label = f'{pred_val:.4f}(rel)'
-        # For non-metric depth, try to estimate actual depth using GT scale
-        if gt_valid_depths:
-            gt_sample = gt_depth[gt_valid]
-            pred_sample = pred_depth[pred_valid & gt_valid]
-            if len(pred_sample) > 0 and len(gt_sample) > 0:
-                # Rough scale estimation using median ratio
-                scale = np.median(gt_sample) / np.median(pred_sample)
-                meter_val = pred_val * scale
-                meter_label = f'\n≈{meter_val:.4f}m'
-            else:
-                meter_label = '\n≈?m'
-        else:
-            meter_label = '\n≈?m'
-    
-    # Combine raw and meter labels
-    return raw_label + meter_label
 
 def _plot_error_comparison(gt_depth, orig_pred_depth, enhanced_pred_depth, gt_valid, orig_pred_valid, enhanced_pred_valid, enhancement_name):
     """Plot side-by-side error comparison for enhancement analysis."""
@@ -779,7 +744,7 @@ def main():
     
     # Common arguments
     parser.add_argument('--model-type', type=str, required=True,
-                        choices=['depthanything', 'zoedepth'],
+                        choices=['depthanything', 'zoedepth', 'vggt'],
                         help='Type of depth estimation model to use')
     parser.add_argument('--dataset-type', type=str, default='flsea',
                         choices=['flsea', 'standard'],
@@ -809,6 +774,12 @@ def main():
                         choices=['N', 'K', 'NK'],
                         help='ZoeDepth model type: N (Indoor/outdoor), K (Outdoor), NK (Outdoor with NYU encoder)')
     
+    # VGGT specific arguments
+    parser.add_argument('--vggt-multi-image', action='store_true',
+                        help='Enable VGGT multi-image mode for enhanced geometric consistency')
+    parser.add_argument('--vggt-sequence-length', type=int, default=10,
+                        help='Number of images to use in VGGT multi-image mode (if dataset supports it)')
+    
     args = parser.parse_args()
     
     # Update output directory to include model information
@@ -816,6 +787,11 @@ def main():
         model_suffix = f"depthanything_{args.encoder}" + ("_metric" if args.metric else "")
     elif args.model_type == 'zoedepth':
         model_suffix = f"zoedepth_{args.zoedepth_type}"
+    elif args.model_type == 'vggt':
+        if args.vggt_multi_image:
+            model_suffix = "vggt_multi"
+        else:
+            model_suffix = "vggt"
     else:
         model_suffix = args.model_type
     

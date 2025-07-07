@@ -9,6 +9,7 @@ output characteristic handling and extensible model registration.
 Supported models:
 - DepthAnything v2 (metric and non-metric variants)
 - ZoeDepth (N, K, NK variants)
+- VGGT
 
 Usage:
     # Create model wrapper
@@ -33,11 +34,19 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from skimage.transform import resize
+import sys
 
 # Import models
 from depth_anything_v2.dpt import DepthAnythingV2
 from zoedepth.models.builder import build_model
 from zoedepth.utils.config import get_config
+
+# Add VGGT imports
+sys.path.append("vggt/")
+from vggt.models.vggt import VGGT
+from vggt.utils.load_fn import load_and_preprocess_images
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
 
 @dataclass
 class ModelOutputCharacteristics:
@@ -103,6 +112,12 @@ class ModelOutputCharacteristics:
             # Example: millimeters -> meters
             converted_data = data * self.scale_factor
             conversion_info['applied'] = True
+        elif self.output_unit == 'affine-invariant':
+            # Case: affine-invariant depth (relative depth requiring scale alignment)
+            # No conversion applied here - scale alignment will be done during metrics computation
+            converted_data = data.copy()
+            conversion_info['applied'] = False
+            conversion_info['note'] = 'Affine-invariant depth - scale alignment required during evaluation'
         else:
             # Case: no conversion needed
             # Example: ZoeDepth metric depth in meters
@@ -153,6 +168,8 @@ class ModelWrapper:
             self._init_depthanything(**kwargs)
         elif self.model_type == 'zoedepth':
             self._init_zoedepth(**kwargs)
+        elif self.model_type == 'vggt':
+            self._init_vggt(**kwargs)
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
     
@@ -181,15 +198,15 @@ class ModelWrapper:
                 display_name="Metric Depth (meters)"
             )
         else:
-            # Non-metric DepthAnything outputs disparity that converts to depth in kilometers
+            # Non-metric DepthAnything outputs disparity that converts to affine-invariant depth
             self.output_characteristics = ModelOutputCharacteristics(
                 is_disparity=True,
                 is_metric=False,
-                output_unit='disparity->km',
+                output_unit='affine-invariant',
                 target_unit='meters',
                 needs_inversion=True,
-                scale_factor=1000.0,  # km -> meters
-                display_name="Relative Disparity (converts to km, then to m)"
+                scale_factor=1.0,  # No scale conversion needed
+                display_name="Relative Disparity (affine-invariant depth)"
             )
         
         print(f"Loading DepthAnything v2 model from {model_path}")
@@ -260,16 +277,51 @@ class ModelWrapper:
         patch_blocks(self.model)
         print("Applied drop_path compatibility patches to model instances")
     
+    def _init_vggt(self, checkpoint_dir='checkpoints', multi_image_mode=False):
+        """Initialize VGGT model"""
+        self.model = VGGT()
+        self.multi_image_mode = multi_image_mode  # Store multi-image mode setting
+        
+        # Load weights
+        weights_path = os.path.join(checkpoint_dir, "vggt.pt")
+        print(f"Loading VGGT model from {weights_path}")
+        
+        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=True)
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+            
+        self.model.load_state_dict(state_dict)
+        self.model = self.model.to(self.device).eval()
+        
+        # VGGT outputs affine-invariant depth (relative depth requiring scale alignment)
+        self.output_characteristics = ModelOutputCharacteristics(
+            is_disparity=False,
+            is_metric=False,  # Affine-invariant depth is not metric (needs scale alignment)
+            output_unit='affine-invariant',
+            target_unit='meters',
+            needs_inversion=False,
+            scale_factor=1.0,  # Scale will be determined by alignment with GT
+            display_name="Affine-Invariant Depth (relative scale)"
+        )
+        
+        if multi_image_mode:
+            print("VGGT initialized in multi-image mode for enhanced geometric consistency")
+    
     def predict(self, image, input_size=518):
         """
-        Run inference on an image
+        Run inference on an image or multiple images
         
         Args:
-            image: Input image (BGR format for DepthAnything, RGB for ZoeDepth)
+            image: Input image/images. For VGGT multi-image mode, can be:
+                   - Single image (BGR format for DepthAnything, RGB for ZoeDepth, path/array for VGGT)
+                   - List of images for VGGT multi-image mode
+                   - Directory path containing images for VGGT multi-image mode
             input_size: Input size for inference
             
         Returns:
-            Predicted depth map
+            Predicted depth map(s)
         """
         with torch.no_grad():
             if self.model_type == 'depthanything':
@@ -286,6 +338,122 @@ class ModelWrapper:
                 tensor = tensor.to(self.device)
                 
                 return self.model.infer(tensor).cpu().numpy().squeeze()
+            elif self.model_type == 'vggt':
+                return self._predict_vggt(image, input_size)
+    
+    def _predict_vggt(self, image, input_size):
+        """VGGT-specific prediction with single and multi-image support"""
+        import tempfile
+        import glob
+        
+        temp_files = []  # Initialize temp_files list
+        
+        # Handle different input types for VGGT
+        if hasattr(self, 'multi_image_mode') and self.multi_image_mode:
+            # Multi-image mode
+            if isinstance(image, str):
+                if os.path.isdir(image):
+                    # Directory path provided
+                    image_paths = sorted(glob.glob(os.path.join(image, "*")))
+                    image_paths = [p for p in image_paths if p.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff'))]
+                    if len(image_paths) == 0:
+                        raise ValueError(f"No valid images found in directory: {image}")
+                else:
+                    # Single image path
+                    image_paths = [image]
+            elif isinstance(image, (list, tuple)):
+                # List of images (paths or arrays)
+                image_paths = []
+                
+                for idx, img in enumerate(image):
+                    if isinstance(img, str):
+                        image_paths.append(img)
+                    else:
+                        # Image array - save temporarily
+                        tmp_file = tempfile.NamedTemporaryFile(suffix=f'_{idx}.jpg', delete=False)
+                        if len(img.shape) == 3 and img.shape[2] == 3:
+                            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        else:
+                            img_rgb = img
+                        cv2.imwrite(tmp_file.name, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+                        image_paths.append(tmp_file.name)
+                        temp_files.append(tmp_file.name)
+                        tmp_file.close()
+            else:
+                # Single image array - convert to single image mode
+                temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                if len(image.shape) == 3 and image.shape[2] == 3:
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    image_rgb = image
+                cv2.imwrite(temp_file.name, cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+                image_paths = [temp_file.name]
+                temp_files = [temp_file.name]
+                temp_file.close()
+            
+            print(f"VGGT multi-image mode: processing {len(image_paths)} images")
+            
+        else:
+            # Single image mode (backward compatibility)
+            if isinstance(image, str):
+                image_paths = [image]
+            else:
+                # Image array provided - save temporarily
+                temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                if len(image.shape) == 3 and image.shape[2] == 3:
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    image_rgb = image
+                cv2.imwrite(temp_file.name, cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+                image_paths = [temp_file.name]
+                temp_files = [temp_file.name]
+                temp_file.close()
+        
+        try:
+            # Preprocess images
+            images_tensor = load_and_preprocess_images(image_paths)
+            images_tensor = images_tensor.to(self.device)
+            
+            # Run inference
+            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+            with torch.cuda.amp.autocast(dtype=dtype):
+                predictions = self.model(images_tensor)
+            
+            # Extract depth - VGGT returns a dict with 'depth' key
+            depth = predictions["depth"].cpu().numpy()
+            
+            # Handle output format based on number of images
+            if hasattr(self, 'multi_image_mode') and self.multi_image_mode and len(image_paths) > 1:
+                # Multi-image mode: return all depth maps and additional info
+                result = {
+                    'depth_maps': depth,  # Shape: (N, H, W) or (N, H, W, 1)
+                    'num_images': len(image_paths),
+                    'extrinsic': None,
+                    'intrinsic': None,
+                    'image_paths': image_paths
+                }
+                
+                # Add camera parameters if available
+                if "pose_enc" in predictions:
+                    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+                    extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images_tensor.shape[-2:])
+                    if extrinsic is not None:
+                        result['extrinsic'] = extrinsic.cpu().numpy()
+                    if intrinsic is not None:
+                        result['intrinsic'] = intrinsic.cpu().numpy()
+                
+                return result
+            else:
+                # Single image mode: return single depth map
+                return depth.squeeze()
+                
+        finally:
+            # Clean up temporary files
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
     
     def postprocess_prediction(self, pred_depth, gt_depth_shape):
         """
@@ -319,7 +487,7 @@ def create_model(model_type: str, device: torch.device, **kwargs) -> ModelWrappe
     Factory function to create model instances
     
     Args:
-        model_type: Type of model to create ('depthanything', 'zoedepth')
+        model_type: Type of model to create ('depthanything', 'zoedepth', 'vggt')
         device: PyTorch device to use
         **kwargs: Model-specific parameters
         
@@ -350,6 +518,13 @@ def get_available_models() -> dict:
             'supports_metric': True,
             'required_params': ['zoedepth_type'],
             'optional_params': ['checkpoint_dir']
+        },
+        'vggt': {
+            'description': 'VGGT - Affine-invariant depth estimation',
+            'variants': ['single-image', 'multi-image'],
+            'supports_metric': False,  # Affine-invariant depth requires scale alignment
+            'required_params': [],
+            'optional_params': ['checkpoint_dir', 'multi_image_mode']
         }
     }
 
@@ -372,5 +547,8 @@ def get_model_name(model_type: str, **kwargs) -> str:
     elif model_type == 'zoedepth':
         zoedepth_type = kwargs.get('zoedepth_type', 'N')
         return f"ZoeDepth-{zoedepth_type}"
+    elif model_type == 'vggt':
+        multi_mode = " (Multi-Image)" if kwargs.get('multi_image_mode', False) else ""
+        return f"VGGT{multi_mode}"
     else:
         return model_type
