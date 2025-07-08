@@ -62,6 +62,9 @@ class MultiModelComparison:
             'VGGT': {
                 'type': 'vggt',
                 'multi_image_mode': False
+            },
+            'Metric3D': {
+                'type': 'metric3d'
             }
         }
         
@@ -204,7 +207,7 @@ class MultiModelComparison:
             basename = sample['basename']
             
             # Prepare depth visualizations
-            gt_viz, pred_vizs, range_texts = self._prepare_depths_for_visualization(
+            gt_viz, pred_vizs, range_texts, aligned_depths = self._prepare_depths_for_visualization(
                 gt_depth, samples, predictions, model_names, row
             )
             
@@ -259,9 +262,13 @@ class MultiModelComparison:
                         model_name in pred_vizs):
                         
                         pred_data = predictions[model_name][row]
-                        display_depth = pred_data['display_depth']  # Use display_depth - final converted depth
                         model_chars = pred_data['model_characteristics']
                         conversion_info = pred_data['conversion_info']
+                        
+                        # Use aligned depth for marker annotation if available
+                        annotation_depth = aligned_depths.get(model_name)
+                        if annotation_depth is None:
+                            annotation_depth = pred_data['display_depth']
                         
                         # Show prediction visualization
                         ax.imshow(pred_vizs[model_name])
@@ -277,12 +284,12 @@ class MultiModelComparison:
                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
                                    verticalalignment='top')
                         
-                        # Add depth scale markers
+                        # Add depth scale markers - use aligned depth for annotation
                         gt_valid = create_simple_valid_mask(gt_depth)
-                        pred_valid = create_robust_valid_mask(display_depth)
+                        pred_valid = create_robust_valid_mask(annotation_depth)
                         gt_valid_depths = [gt_depth[gt_valid]] if np.any(gt_valid) else []
                         
-                        self._add_depth_markers(ax, display_depth, pred_valid, model_chars, 
+                        self._add_depth_markers(ax, annotation_depth, pred_valid, model_chars, 
                                               conversion_info, gt_valid_depths, gt_depth, gt_valid)
                     else:
                         # No prediction available
@@ -346,6 +353,7 @@ class MultiModelComparison:
         
         # Prepare prediction visualizations (individual normalization for each)
         pred_vizs = {}
+        aligned_depths = {}  # Store aligned depths for marker annotation
         for model_name in model_names:
             if (current_row < len(predictions[model_name]) and 
                 predictions[model_name][current_row] is not None):
@@ -413,8 +421,14 @@ class MultiModelComparison:
                             range_texts[model_name] += '\n≈?-?m'
                 else:
                     range_texts[model_name] = "N/A"
+                
+                # Store aligned depth for marker annotation
+                aligned_depths[model_name] = display_depth.copy()
+            else:
+                range_texts[model_name] = "N/A"
+                aligned_depths[model_name] = None
         
-        return gt_viz, pred_vizs, range_texts
+        return gt_viz, pred_vizs, range_texts, aligned_depths
     
     def _prepare_individual_depth_visualization(self, depth_map: np.ndarray, use_robust_mask: bool = True) -> np.ndarray:
         """Prepare individual depth map for visualization with independent normalization"""

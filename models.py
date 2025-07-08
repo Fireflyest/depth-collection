@@ -10,6 +10,7 @@ Supported models:
 - DepthAnything v2 (metric and non-metric variants)
 - ZoeDepth (N, K, NK variants)
 - VGGT
+- Metric3D
 
 Usage:
     # Create model wrapper
@@ -46,6 +47,13 @@ sys.path.append("vggt/")
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+# Add ViT Large model imports
+try:
+    from mmcv.utils import Config
+except:
+    from mmengine import Config
+from mono.model.monodepth_model import get_configured_monodepth_model
 
 
 @dataclass
@@ -170,6 +178,8 @@ class ModelWrapper:
             self._init_zoedepth(**kwargs)
         elif self.model_type == 'vggt':
             self._init_vggt(**kwargs)
+        elif self.model_type == 'metric3d':
+            self._init_metric3d(**kwargs)
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
     
@@ -309,6 +319,44 @@ class ModelWrapper:
         if multi_image_mode:
             print("VGGT initialized in multi-image mode for enhanced geometric consistency")
     
+    def _init_metric3d(self, checkpoint_dir='checkpoints'):
+        """Initialize Metric3D model"""
+        # Set configuration file path
+        cfg_file = 'mono/configs/HourglassDecoder/vit.raft5.large.py'
+        
+        # Load configuration
+        cfg = Config.fromfile(cfg_file)
+        # Convert Config object to dictionary format
+        if hasattr(cfg, '_cfg_dict'):
+            cfg_dict = cfg._cfg_dict
+        else:
+            cfg_dict = dict(cfg)
+        
+        # Create model
+        self.model = get_configured_monodepth_model(cfg_dict)
+        
+        # Load weights
+        weights_path = os.path.join(checkpoint_dir, "metric_depth_vit_large_800k.pth")
+        print(f"Loading Metric3D model from {weights_path}")
+        
+        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=True)
+        self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        self.model.eval()
+        
+        # Move model to device
+        self.model = self.model.to(self.device)
+        
+        # Metric3D outputs metric depth in meters
+        self.output_characteristics = ModelOutputCharacteristics(
+            is_disparity=False,
+            is_metric=True,
+            output_unit='meters',
+            target_unit='meters',
+            needs_inversion=False,
+            scale_factor=1.0,
+            display_name="Metric Depth (meters)"
+        )
+    
     def predict(self, image, input_size=518):
         """
         Run inference on an image or multiple images
@@ -340,6 +388,8 @@ class ModelWrapper:
                 return self.model.infer(tensor).cpu().numpy().squeeze()
             elif self.model_type == 'vggt':
                 return self._predict_vggt(image, input_size)
+            elif self.model_type == 'metric3d':
+                return self._predict_metric3d(image)
     
     def _predict_vggt(self, image, input_size):
         """VGGT-specific prediction with single and multi-image support"""
@@ -455,6 +505,49 @@ class ModelWrapper:
                 except:
                     pass
     
+    def _predict_metric3d(self, image):
+        """Metric3D-specific prediction with proper preprocessing"""
+        # Convert BGR to RGB if needed
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            rgb = image
+        
+        # ViT model input size
+        input_size = (616, 1064)
+        h, w = rgb.shape[:2]
+        scale = min(input_size[0] / h, input_size[1] / w)
+        rgb = cv2.resize(rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
+        
+        # Padding to input_size
+        padding = [123.675, 116.28, 103.53]
+        h, w = rgb.shape[:2]
+        pad_h = input_size[0] - h
+        pad_w = input_size[1] - w
+        pad_h_half = pad_h // 2
+        pad_w_half = pad_w // 2
+        rgb = cv2.copyMakeBorder(rgb, pad_h_half, pad_h - pad_h_half, 
+                               pad_w_half, pad_w - pad_w_half, 
+                               cv2.BORDER_CONSTANT, value=padding)
+        
+        # Normalize
+        mean = torch.tensor([123.675, 116.28, 103.53]).float()[:, None, None]
+        std = torch.tensor([58.395, 57.12, 57.375]).float()[:, None, None]
+        rgb = torch.from_numpy(rgb.transpose((2, 0, 1))).float()
+        rgb = torch.div((rgb - mean), std)
+        rgb = rgb[None, :, :, :]  # add batch dimension
+        
+        # Move to device
+        rgb = rgb.to(self.device)
+        mean = mean.to(self.device)
+        std = std.to(self.device)
+        
+        # Model inference
+        pred_depth, confidence, output_dict = self.model.inference({'input': rgb})
+        
+        # Return depth on CPU as numpy array
+        return pred_depth.squeeze().cpu().numpy()
+    
     def postprocess_prediction(self, pred_depth, gt_depth_shape):
         """
         Post-process prediction based on model output characteristics
@@ -487,7 +580,7 @@ def create_model(model_type: str, device: torch.device, **kwargs) -> ModelWrappe
     Factory function to create model instances
     
     Args:
-        model_type: Type of model to create ('depthanything', 'zoedepth', 'vggt')
+        model_type: Type of model to create ('depthanything', 'zoedepth', 'vggt', 'metric3d')
         device: PyTorch device to use
         **kwargs: Model-specific parameters
         
@@ -525,6 +618,13 @@ def get_available_models() -> dict:
             'supports_metric': False,  # Affine-invariant depth requires scale alignment
             'required_params': [],
             'optional_params': ['checkpoint_dir', 'multi_image_mode']
+        },
+        'metric3d': {
+            'description': 'Metric3D - Metric depth estimation',
+            'variants': ['large'],
+            'supports_metric': True,
+            'required_params': [],
+            'optional_params': ['checkpoint_dir']
         }
     }
 
@@ -550,5 +650,7 @@ def get_model_name(model_type: str, **kwargs) -> str:
     elif model_type == 'vggt':
         multi_mode = " (Multi-Image)" if kwargs.get('multi_image_mode', False) else ""
         return f"VGGT{multi_mode}"
+    elif model_type == 'metric3d':
+        return "Metric3D"
     else:
         return model_type

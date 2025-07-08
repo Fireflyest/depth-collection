@@ -71,13 +71,13 @@ def compute_depth_metrics(pred: Union[np.ndarray, torch.Tensor],
     if mask is not None and isinstance(mask, torch.Tensor):
         mask = mask.squeeze().cpu().numpy().astype(bool)
     
-    # Create robust valid value masks using unified function
+    # Create basic valid mask using simple validity check (no range filtering yet)
     if mask is None:
         mask = np.ones_like(gt, dtype=bool)
     
-    # Apply appropriate mask to pred and gt
-    # Pred uses robust mask (filters >30m), GT uses simple mask (basic validity only)
-    pred_valid = create_robust_valid_mask(pred) & mask
+    # Apply basic validity masks (no range filtering at this stage)
+    # Use simple mask for both pred and gt - range filtering will be done after scale alignment
+    pred_valid = create_simple_valid_mask(pred) & mask
     gt_valid = create_simple_valid_mask(gt) & mask
     
     # Use intersection of both valid masks
@@ -111,6 +111,27 @@ def compute_depth_metrics(pred: Union[np.ndarray, torch.Tensor],
     
     # Align scale - critical for comparing relative depth with metric depth
     scale_factor, pred_aligned = align_depth_scale(pred, gt, method=align_method)
+    
+    # Now apply robust filtering to the final metric depths (after scale alignment)
+    # This filters out unreasonable depth values in the final metric domain
+    pred_robust_mask = create_robust_valid_mask(pred_aligned)
+    gt_robust_mask = create_robust_valid_mask(gt)
+    
+    # Apply robust filtering to final aligned data
+    final_valid_mask = pred_robust_mask & gt_robust_mask
+    
+    if final_valid_mask.sum() == 0:
+        # Return zeros if no valid pixels after robust filtering
+        return {
+            'scale_factor': scale_factor,
+            'rmse': 0, 'rmse_log': 0, 'abs_rel': 0, 'sq_rel': 0,
+            'delta1': 0, 'delta2': 0, 'delta3': 0, 'log10': 0,
+            'silog': 0, 'pearson_corr': 0, 'spearman_corr': 0
+        }
+    
+    # Apply robust mask to both aligned prediction and GT
+    pred_aligned = pred_aligned[final_valid_mask]
+    gt = gt[final_valid_mask]
     
     # Threshold accuracy metrics: δ < 1.25^n (scale-invariant)
     thresh = np.maximum((gt / (pred_aligned + eps)), ((pred_aligned + eps) / (gt + eps)))
@@ -333,13 +354,14 @@ def extract_depth_maps(results):
     
     return [depth_maps] if not isinstance(depth_maps, list) else depth_maps
 
-def create_robust_valid_mask(depth_map: np.ndarray, max_reasonable_depth: float = 30) -> np.ndarray:
+def create_robust_valid_mask(depth_map: np.ndarray, max_reasonable_depth: float = 30, min_reasonable_depth: float = 0.2) -> np.ndarray:
     """
     Create a robust valid mask that filters out invalid and extreme depth values
     
     Args:
         depth_map: Input depth map
         max_reasonable_depth: Maximum reasonable depth value (meters or relative units)
+        min_reasonable_depth: Minimum reasonable depth value (meters or relative units)
         
     Returns:
         Boolean mask for valid pixels
@@ -350,11 +372,10 @@ def create_robust_valid_mask(depth_map: np.ndarray, max_reasonable_depth: float 
     if not np.any(basic_valid):
         return basic_valid
     
-    # Simple and strict: only allow values within reasonable range
-    # No statistical outlier removal that might conflict with max_reasonable_depth
-    reasonable_mask = depth_map <= max_reasonable_depth
+    # Filter out both too close and too far depths
+    reasonable_mask = (depth_map >= min_reasonable_depth) & (depth_map <= max_reasonable_depth)
     
-    # Combine basic validity with reasonable depth limit
+    # Combine basic validity with reasonable depth range
     final_mask = basic_valid & reasonable_mask
     
     return final_mask

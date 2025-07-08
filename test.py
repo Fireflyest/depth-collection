@@ -16,6 +16,9 @@ Usage:
     
     # For VGGT
     python test.py --model-type vggt --dataset-type standard --data-root assets/FLSea/red_sea/pier_path --num-samples 10
+
+    # For Metric3D
+    python test.py --model-type metric3d --dataset-type standard --data-root assets/FLSea/red_sea/pier_path --num-samples 10
 """
 
 import os
@@ -337,6 +340,13 @@ def validate_dataset(args):
             multi_image_mode=args.vggt_multi_image
         )
         model_name = get_model_name('vggt', multi_image_mode=args.vggt_multi_image)
+    elif args.model_type == 'metric3d':
+        model = create_model(
+            model_type='metric3d',
+            device=device,
+            checkpoint_dir=args.checkpoint_dir
+        )
+        model_name = get_model_name('metric3d')
     else:
         raise ValueError(f"Unsupported model type: {args.model_type}")
     
@@ -748,7 +758,7 @@ def main():
     
     # Common arguments
     parser.add_argument('--model-type', type=str, required=True,
-                        choices=['depthanything', 'zoedepth', 'vggt'],
+                        choices=['depthanything', 'zoedepth', 'vggt', 'metric3d'],
                         help='Type of depth estimation model to use')
     parser.add_argument('--dataset-type', type=str, default='flsea',
                         choices=['flsea', 'standard'],
@@ -796,6 +806,8 @@ def main():
             model_suffix = "vggt_multi"
         else:
             model_suffix = "vggt"
+    elif args.model_type == 'metric3d':
+        model_suffix = "metric3d"
     else:
         model_suffix = args.model_type
     
