@@ -25,7 +25,7 @@ import PIL.Image
 # Import model wrapper and characteristics
 from models import create_model, get_model_name, ModelOutputCharacteristics
 from dataset_base import create_dataset
-from depth_utils import compute_depth_metrics, format_depth_label, create_robust_valid_mask
+from depth_utils import compute_depth_metrics, format_depth_label, create_robust_valid_mask, create_simple_valid_mask
 
 # Suppress warnings
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -240,7 +240,7 @@ class MultiModelComparison:
                         ax.set_title(col_headers[col], fontsize=14, fontweight='bold')
                     
                     # Add depth range annotation
-                    gt_valid = ~np.isnan(gt_depth) & ~np.isinf(gt_depth) & (gt_depth > 0)
+                    gt_valid = create_simple_valid_mask(gt_depth)
                     if np.any(gt_valid):
                         ax.text(0.02, 0.98, range_texts['gt'], 
                                transform=ax.transAxes, fontsize=8, 
@@ -259,7 +259,7 @@ class MultiModelComparison:
                         model_name in pred_vizs):
                         
                         pred_data = predictions[model_name][row]
-                        display_depth = pred_data['display_depth']
+                        display_depth = pred_data['display_depth']  # Use display_depth - final converted depth
                         model_chars = pred_data['model_characteristics']
                         conversion_info = pred_data['conversion_info']
                         
@@ -278,7 +278,7 @@ class MultiModelComparison:
                                    verticalalignment='top')
                         
                         # Add depth scale markers
-                        gt_valid = create_robust_valid_mask(gt_depth)
+                        gt_valid = create_simple_valid_mask(gt_depth)
                         pred_valid = create_robust_valid_mask(display_depth)
                         gt_valid_depths = [gt_depth[gt_valid]] if np.any(gt_valid) else []
                         
@@ -332,11 +332,11 @@ class MultiModelComparison:
     
     def _prepare_depths_for_visualization(self, gt_depth, samples, predictions, model_names, current_row):
         """Prepare depth visualizations with individual normalization for each depth map"""
-        # Prepare GT visualization (individual normalization)
-        gt_viz = self._prepare_individual_depth_visualization(gt_depth)
+        # Prepare GT visualization (individual normalization) - use simple mask for GT
+        gt_viz = self._prepare_individual_depth_visualization(gt_depth, use_robust_mask=False)
         
         # Create range text for GT
-        gt_valid = create_robust_valid_mask(gt_depth)
+        gt_valid = create_simple_valid_mask(gt_depth)
         if np.any(gt_valid):
             gt_min = np.percentile(gt_depth[gt_valid], 2)
             gt_max = np.percentile(gt_depth[gt_valid], 98)
@@ -354,8 +354,28 @@ class MultiModelComparison:
                 model_chars = pred_data['model_characteristics']
                 conversion_info = pred_data['conversion_info']
                 
-                # Individual normalization for this prediction
-                pred_viz = self._prepare_individual_depth_visualization(display_depth)
+                # For affine-invariant depth, convert to metric using GT scale alignment
+                if (model_chars.output_unit == 'affine-invariant' and 
+                    not conversion_info.get('applied', False)):
+                    # Scale align with GT to get metric depth for visualization
+                    gt_sample_data = samples[current_row]
+                    gt_depth_sample = gt_sample_data['gt_depth']
+                    gt_valid_sample = create_simple_valid_mask(gt_depth_sample)
+                    display_valid_sample = create_simple_valid_mask(display_depth)
+                    
+                    if np.any(gt_valid_sample) and np.any(display_valid_sample):
+                        # Find overlapping valid pixels
+                        common_valid = gt_valid_sample & display_valid_sample
+                        if np.any(common_valid):
+                            # Use median ratio for scale alignment
+                            gt_vals = gt_depth_sample[common_valid]
+                            pred_vals = display_depth[common_valid]
+                            if len(gt_vals) > 0 and len(pred_vals) > 0:
+                                scale = np.median(gt_vals) / np.median(pred_vals)
+                                display_depth = display_depth * scale
+                
+                # Individual normalization for this prediction - use robust mask for predictions
+                pred_viz = self._prepare_individual_depth_visualization(display_depth, use_robust_mask=True)
                 pred_vizs[model_name] = pred_viz
                 
                 # Create range text with proper unit handling
@@ -396,10 +416,13 @@ class MultiModelComparison:
         
         return gt_viz, pred_vizs, range_texts
     
-    def _prepare_individual_depth_visualization(self, depth_map: np.ndarray) -> np.ndarray:
+    def _prepare_individual_depth_visualization(self, depth_map: np.ndarray, use_robust_mask: bool = True) -> np.ndarray:
         """Prepare individual depth map for visualization with independent normalization"""
-        # Create mask for valid pixels, excluding invalid/extreme values
-        valid_mask = create_robust_valid_mask(depth_map)
+        # Create mask for valid pixels - use robust for predictions, simple for GT
+        if use_robust_mask:
+            valid_mask = create_robust_valid_mask(depth_map)
+        else:
+            valid_mask = create_simple_valid_mask(depth_map)
         
         if not np.any(valid_mask):
             # Return black RGB image for no valid data

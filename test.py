@@ -44,7 +44,8 @@ from depth_utils import (
     prepare_depth_visualization,
     create_depth_range_text,
     extract_depth_maps,
-    create_robust_valid_mask
+    create_robust_valid_mask,
+    create_simple_valid_mask
 )
 
 # Suppress warnings
@@ -79,8 +80,8 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
     orig_pred_viz = np.zeros_like(orig_pred_depth, dtype=np.float32)
     enhanced_pred_viz = np.zeros_like(enhanced_pred_depth, dtype=np.float32)
     
-    # Create robust masks for valid pixels that filter out extreme values
-    gt_valid = create_robust_valid_mask(gt_depth)
+    # Create masks: simple mask for GT, robust mask for predictions to filter out extreme values
+    gt_valid = create_simple_valid_mask(gt_depth)
     orig_pred_valid = create_robust_valid_mask(orig_pred_depth)
     enhanced_pred_valid = create_robust_valid_mask(enhanced_pred_depth)
     
@@ -216,6 +217,7 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
             for y_pos in y_positions:
                 if orig_pred_valid[y_pos, x_center]:
                     pred_val = orig_pred_depth[y_pos, x_center]
+                    # Mask already filters reasonable range, no additional check needed
                     full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, orig_pred_depth, orig_pred_valid, gt_valid)
                     
                     plt.annotate(full_label, 
@@ -240,6 +242,7 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
             for y_pos in y_positions:
                 if enhanced_pred_valid[y_pos, x_center]:
                     pred_val = enhanced_pred_depth[y_pos, x_center]
+                    # Mask already filters reasonable range, no additional check needed
                     full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, enhanced_pred_depth, enhanced_pred_valid, gt_valid)
                     
                     plt.annotate(full_label, 
@@ -269,6 +272,7 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
             for y_pos in y_positions:
                 if orig_pred_valid[y_pos, x_center]:
                     pred_val = orig_pred_depth[y_pos, x_center]
+                    # Mask already filters reasonable range, no additional check needed
                     full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, orig_pred_depth, orig_pred_valid, gt_valid)
                     
                     plt.annotate(full_label, 

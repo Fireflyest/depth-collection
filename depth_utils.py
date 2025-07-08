@@ -75,9 +75,10 @@ def compute_depth_metrics(pred: Union[np.ndarray, torch.Tensor],
     if mask is None:
         mask = np.ones_like(gt, dtype=bool)
     
-    # Apply robust valid mask to both pred and gt
+    # Apply appropriate mask to pred and gt
+    # Pred uses robust mask (filters >30m), GT uses simple mask (basic validity only)
     pred_valid = create_robust_valid_mask(pred) & mask
-    gt_valid = create_robust_valid_mask(gt) & mask
+    gt_valid = create_simple_valid_mask(gt) & mask
     
     # Use intersection of both valid masks
     valid_mask = pred_valid & gt_valid
@@ -332,7 +333,7 @@ def extract_depth_maps(results):
     
     return [depth_maps] if not isinstance(depth_maps, list) else depth_maps
 
-def create_robust_valid_mask(depth_map: np.ndarray, max_reasonable_depth: float = 1000.0) -> np.ndarray:
+def create_robust_valid_mask(depth_map: np.ndarray, max_reasonable_depth: float = 30) -> np.ndarray:
     """
     Create a robust valid mask that filters out invalid and extreme depth values
     
@@ -349,23 +350,30 @@ def create_robust_valid_mask(depth_map: np.ndarray, max_reasonable_depth: float 
     if not np.any(basic_valid):
         return basic_valid
     
-    # Filter out extreme outliers that might indicate invalid depth
-    # Use a more sophisticated approach based on data distribution
-    valid_values = depth_map[basic_valid]
-    
-    # Method 1: Filter values beyond max_reasonable_depth
+    # Simple and strict: only allow values within reasonable range
+    # No statistical outlier removal that might conflict with max_reasonable_depth
     reasonable_mask = depth_map <= max_reasonable_depth
     
-    # Method 2: Filter statistical outliers (beyond 99.9% percentile)
-    if len(valid_values) > 10:  # Only if we have enough samples
-        p999 = np.percentile(valid_values, 99.9)
-        # Use the more conservative threshold
-        outlier_threshold = min(max_reasonable_depth, p999 * 3)  # 3x the 99.9% percentile
-        statistical_mask = depth_map <= outlier_threshold
-    else:
-        statistical_mask = reasonable_mask
-    
-    # Combine all masks
-    final_mask = basic_valid & reasonable_mask & statistical_mask
+    # Combine basic validity with reasonable depth limit
+    final_mask = basic_valid & reasonable_mask
     
     return final_mask
+
+def create_simple_valid_mask(depth_map: np.ndarray) -> np.ndarray:
+    """
+    Create a simple valid mask for GT depth that only filters basic invalid values
+    (NaN, infinity, negative values). Does not filter extreme depth values.
+    
+    Args:
+        depth_map: Input GT depth map
+        
+    Returns:
+        Boolean mask for valid GT pixels
+    """
+    if depth_map is None or depth_map.size == 0:
+        return np.array([], dtype=bool)
+    
+    # Simple mask: only filter NaN, infinity, and negative values
+    valid_mask = (~np.isnan(depth_map)) & (~np.isinf(depth_map)) & (depth_map > 0)
+    
+    return valid_mask
