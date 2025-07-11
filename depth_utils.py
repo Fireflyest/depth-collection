@@ -301,18 +301,11 @@ def prepare_depths_for_visualization(gt_depth, predictions, model_names, current
             if (model_chars.output_unit == 'affine-invariant' and not conversion_info.get('applied', False)):
                 # Scale align with GT to get metric depth for visualization
                 display_valid_mask = create_simple_valid_mask(display_depth)
-                common_valid = gt_valid_mask & display_valid_mask
-                if np.any(common_valid):
-                    # Use median ratio for scale alignment
-                    gt_vals = gt_valid_mask[common_valid]
-                    pred_vals = display_depth[common_valid]
-                    if len(gt_vals) > 0 and len(pred_vals) > 0:
-                        scale, _ = align_depth_scale(pred_vals, gt_vals, method='median')
-                        aligned_depth = display_depth * scale
-                        aligned_valid_mask = create_metric_valid_mask(aligned_depth)
-                        aligned_vals = aligned_depth[aligned_valid_mask]
-                        scale, _ = align_depth_scale(aligned_vals, gt_vals, method='median')
-                        aligned_depths[model_name] = display_depth * scale
+                display_vals = display_depth[display_valid_mask]
+                gt_vals = gt_depth[gt_valid_mask]
+                if len(gt_vals) > 0 and len(display_vals) > 0:
+                    scale, _ = align_depth_scale(display_vals, gt_vals, method='median')
+                    aligned_depths[model_name] = display_depth * scale
 
             # Individual normalization for this prediction - use robust mask for predictions
             aligned_valid_mask, aligned_min, aligned_max, pred_viz = prepare_individual_depth_visualization(aligned_depths[model_name], use_robust_mask=True)
