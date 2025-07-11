@@ -25,7 +25,7 @@ import PIL.Image
 # Import model wrapper and characteristics
 from models import create_model
 from dataset_base import create_dataset
-from depth_utils import compute_depth_metrics, create_robust_valid_mask, create_simple_valid_mask, add_depth_markers, prepare_depths_for_visualization, prepare_individual_depth_visualization
+from depth_utils import compute_depth_metrics, add_depth_markers, prepare_depths_for_visualization
 
 # Suppress warnings
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -191,8 +191,8 @@ class MultiModelComparison:
             basename = sample['basename']
             
             # Prepare depth visualizations
-            gt_viz, pred_vizs, range_texts, aligned_depths = prepare_depths_for_visualization(
-                gt_depth, samples, predictions, model_names, row
+            gt_viz, gt_valid_mask, display_depths, display_vizs, aligned_valid_masks, aligned_depths, range_texts = prepare_depths_for_visualization(
+                gt_depth, predictions, model_names, row
             )
             
             # Create single row figure
@@ -225,56 +225,35 @@ class MultiModelComparison:
                     ax.imshow(gt_viz)
                     if row == 0:
                         ax.set_title(col_headers[col], fontsize=14, fontweight='bold')
-                    
-                    # Add depth range annotation
-                    gt_valid = create_simple_valid_mask(gt_depth)
-                    if np.any(gt_valid):
-                        ax.text(0.02, 0.98, range_texts['gt'], 
-                               transform=ax.transAxes, fontsize=8, 
-                               bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
-                               verticalalignment='top')
+                
+                    ax.text(0.02, 0.98, range_texts['gt'], 
+                            transform=ax.transAxes, fontsize=8, 
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
+                            verticalalignment='top')
                     
                     # Add depth scale markers for GT
-                    add_depth_markers(ax, gt_depth, gt_valid, None, None, None, None, None)
+                    add_depth_markers(ax, gt_valid_mask, gt_depth, None, True)
                 
                 else:  # Model predictions
                     model_idx = col - 2
                     model_name = model_names[model_idx]
                     
-                    if (row < len(predictions[model_name]) and 
-                        predictions[model_name][row] is not None and 
-                        model_name in pred_vizs):
-                        
+                    if (row < len(predictions[model_name]) and predictions[model_name][row] is not None and model_name in display_vizs):
                         pred_data = predictions[model_name][row]
                         model_chars = pred_data['model_characteristics']
-                        conversion_info = pred_data['conversion_info']
-                        
-                        # Use aligned depth for marker annotation if available
-                        annotation_depth = aligned_depths.get(model_name)
-                        if annotation_depth is None:
-                            annotation_depth = pred_data['display_depth']
-                        
-                        # Show prediction visualization
-                        ax.imshow(pred_vizs[model_name])
-                        
+                        ax.imshow(display_vizs[model_name])
                         if row == 0:
                             title = f"{model_name}\n({model_chars.display_name})"
                             ax.set_title(title, fontsize=12, fontweight='bold')
-                        
-                        # Add range annotation
-                        if model_name in range_texts:
-                            ax.text(0.02, 0.98, range_texts[model_name], 
-                                   transform=ax.transAxes, fontsize=7,
-                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
-                                   verticalalignment='top')
-                        
-                        # Add depth scale markers - use aligned depth for annotation
-                        gt_valid = create_simple_valid_mask(gt_depth)
-                        pred_valid = create_robust_valid_mask(annotation_depth)
-                        gt_valid_depths = [gt_depth[gt_valid]] if np.any(gt_valid) else []
-                        
-                        add_depth_markers(ax, annotation_depth, pred_valid, model_chars, 
-                                              conversion_info, gt_valid_depths, gt_depth, gt_valid)
+
+                        ax.text(0.02, 0.98, range_texts[model_name], 
+                            transform=ax.transAxes, fontsize=7,
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
+                            verticalalignment='top')
+
+                        add_depth_markers(ax, aligned_valid_masks[model_name],
+                                          display_depths[model_name], aligned_depths[model_name], model_chars.is_metric)
+
                     else:
                         # No prediction available
                         ax.text(0.5, 0.5, 'No Prediction', ha='center', va='center', 
@@ -320,10 +299,7 @@ class MultiModelComparison:
             print(f"📊 Final image contains {rows_to_include} rows out of {n_samples} total samples")
         else:
             print("❌ No rows to concatenate")
-    
 
-    
-    
     def compute_and_print_metrics(self, results: Dict):
         """Compute and print comparison metrics between models"""
         samples = results['samples']

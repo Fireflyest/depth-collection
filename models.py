@@ -313,7 +313,7 @@ class ModelWrapper:
             target_unit='meters',
             needs_inversion=False,
             scale_factor=1.0,  # Scale will be determined by alignment with GT
-            display_name="Affine-Invariant Depth (relative scale)"
+            display_name="Affine-Invariant Depth"
         )
         
         if multi_image_mode:

@@ -41,12 +41,13 @@ from dataset_base import create_dataset, get_available_datasets
 
 # Import depth processing utilities
 from depth_utils import (
-    align_depth_scale, 
-    compute_depth_metrics, 
-    format_depth_label, 
+    align_depth_scale,
+    compute_depth_metrics,
     extract_depth_maps,
-    create_robust_valid_mask,
-    create_simple_valid_mask
+    create_metric_valid_mask,
+    create_simple_valid_mask,
+    prepare_depths_for_visualization,
+    add_depth_markers,
 )
 
 # Suppress warnings
@@ -58,245 +59,61 @@ def visualize_comparison_combined(orig_img, enhanced_img, gt_depth, orig_pred_de
                                 conversion_info=None):
     """
     Create a visualization for depth prediction results
-    
-    Args:
-        orig_img: Original RGB image
-        enhanced_img: Enhanced RGB image (may be same as original if no enhancement)
-        gt_depth: Ground truth depth map
-        orig_pred_depth: Predicted depth map from original image
-        enhanced_pred_depth: Predicted depth map from enhanced image (may be same as original)
-        file_prefix: Prefix for saved files
-        output_dir: Directory to save visualizations
-        model_characteristics: ModelOutputCharacteristics describing the model output
-        conversion_info: Information about unit conversion applied
+    严格参考 visualizations.py 的 create_comparison_visualization 实现方式，统一 prepare_depths_for_visualization
     """
-    # Check if we have actual enhancement (different images)
-    has_enhancement = not np.array_equal(orig_img, enhanced_img)
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Prepare for visualization - handle invalid values
-    gt_viz = np.zeros_like(gt_depth, dtype=np.float32)
-    orig_pred_viz = np.zeros_like(orig_pred_depth, dtype=np.float32)
-    enhanced_pred_viz = np.zeros_like(enhanced_pred_depth, dtype=np.float32)
-    
-    # Create masks: simple mask for GT, robust mask for predictions to filter out extreme values
+    # 统一处理所有深度可视化、范围文本、掩码、色彩映射
+    samples = [
+        {'original_image': orig_img, 'gt_depth': gt_depth, 'basename': file_prefix}
+    ]
+    predictions = {
+        'Original': [
+            {
+                'display_depth': orig_pred_depth,
+                'model_characteristics': model_characteristics,
+                'conversion_info': conversion_info
+            }
+        ],
+        'Enhanced': [
+            {
+                'display_depth': enhanced_pred_depth,
+                'model_characteristics': model_characteristics,
+                'conversion_info': conversion_info
+            }
+        ]
+    }
+    model_names = ['Original', 'Enhanced']
+    # 使用统一工具函数
+    gt_viz, pred_vizs, range_texts, aligned_depths = prepare_depths_for_visualization(
+        gt_depth, samples, predictions, model_names, 0
+    )
     gt_valid = create_simple_valid_mask(gt_depth)
-    orig_pred_valid = create_robust_valid_mask(orig_pred_depth)
-    enhanced_pred_valid = create_robust_valid_mask(enhanced_pred_depth)
-    
-    # Create a combined mask of valid pixels across all depth maps for consistent normalization
-    gt_valid_depths = []
-    pred_valid_depths = []
-    
-    if np.any(gt_valid):
-        gt_valid_depths.append(gt_depth[gt_valid])
-    if np.any(orig_pred_valid):
-        pred_valid_depths.append(orig_pred_depth[orig_pred_valid])
-    if np.any(enhanced_pred_valid):
-        pred_valid_depths.append(enhanced_pred_depth[enhanced_pred_valid])
-    
-    # 分别为ground truth和预测深度确定范围
-    if gt_valid_depths:
-        gt_valid_values = np.concatenate(gt_valid_depths)
-        gt_min_depth, gt_max_depth = np.percentile(gt_valid_values, [2, 98])
-        gt_range_text = f"GT Depth: {gt_min_depth:.4f} - {gt_max_depth:.4f} (meters)"
-        
-        # 为gt单独归一化
-        if np.any(gt_valid):
-            gt_viz[gt_valid] = np.clip((gt_depth[gt_valid] - gt_min_depth) / (gt_max_depth - gt_min_depth + 1e-8), 0, 1)
-    else:
-        gt_range_text = "GT Depth: N/A"
-    
-    # 为预测深度确定范围
-    if pred_valid_depths:
-        pred_valid_values = np.concatenate(pred_valid_depths)
-        pred_min_depth, pred_max_depth = np.percentile(pred_valid_values, [5, 95])
-        
-        # Create range text based on model characteristics
-        pred_range_text = f"Pred {model_characteristics.display_name}: {pred_min_depth:.4f} - {pred_max_depth:.4f}"
-        
-        # 归一化预测深度
-        if np.any(orig_pred_valid):
-            orig_pred_viz[orig_pred_valid] = np.clip((orig_pred_depth[orig_pred_valid] - pred_min_depth) / (pred_max_depth - pred_min_depth + 1e-8), 0, 1)
-        if np.any(enhanced_pred_valid):
-            enhanced_pred_viz[enhanced_pred_valid] = np.clip((enhanced_pred_depth[enhanced_pred_valid] - pred_min_depth) / (pred_max_depth - pred_min_depth + 1e-8), 0, 1)
-    else:
-        pred_range_text = "Pred: N/A"
-    
-    # Apply colormap with custom handling for invalid values
-    cm_jet = plt.colormaps['jet']  # Modern way to get colormap
-    
-    # Ground truth (depth map: small values=near, large values=far)
-    # For depth: near=small value=red, far=large value=blue
-    # Note: jet colormap goes from blue(0) to red(1), so we need to INVERT for depth
-    gt_colored = np.zeros((*gt_viz.shape, 4), dtype=np.float32)
-    gt_colored[gt_valid] = cm_jet(1.0 - gt_viz[gt_valid])  # Invert mapping for depth (low depth=near=red, high depth=far=blue)
-    gt_colored[~gt_valid, 3] = 0  # Set alpha=0 for invalid regions
-    gt_rgb = gt_colored[:, :, :3]  # Keep as float32 in range [0, 1] for imshow
-    
-    # Prediction visualization depends on whether prediction was originally disparity
-    # After processing, all predictions are in depth space, so use consistent mapping
-    orig_pred_colored = np.zeros((*orig_pred_viz.shape, 4), dtype=np.float32)
-    orig_pred_colored[orig_pred_valid] = cm_jet(1.0 - orig_pred_viz[orig_pred_valid])  # Invert mapping for depth
-    orig_pred_colored[~orig_pred_valid, 3] = 0
-    orig_pred_rgb = orig_pred_colored[:, :, :3]
-    
-    enhanced_pred_colored = np.zeros((*enhanced_pred_viz.shape, 4), dtype=np.float32)
-    enhanced_pred_colored[enhanced_pred_valid] = cm_jet(1.0 - enhanced_pred_viz[enhanced_pred_valid])  # Invert mapping for depth
-    enhanced_pred_colored[~enhanced_pred_valid, 3] = 0
-    enhanced_pred_rgb = enhanced_pred_colored[:, :, :3]
-    
-    pred_title_suffix = "Depth Prediction (Near=Red, Far=Blue)"
-    
-    # Create visualization with different layouts based on enhancement availability
-    if has_enhancement:
-        # 2x3 layout for comparison
-        plt.figure(figsize=(18, 12))
-        
-        # First row: Input images and ground truth
-        plt.subplot(2, 3, 1)
-        plt.imshow(cv2.cvtColor(orig_img.astype(np.uint8), cv2.COLOR_BGR2RGB))
-        plt.title('Original Image')
-        plt.axis('off')
-        
-        plt.subplot(2, 3, 2)
-        plt.imshow(cv2.cvtColor(enhanced_img.astype(np.uint8), cv2.COLOR_BGR2RGB))
-        plt.title('Enhanced Image')
-        plt.axis('off')
-        
-        plt.subplot(2, 3, 3)
-        plt.imshow(gt_rgb)
-        plt.title(f'Ground Truth Depth (Near=Red, Far=Blue)\n{gt_range_text}')
-    else:
-        # 4x1 layout for single image analysis (4 rows, 1 column)
-        plt.figure(figsize=(10, 20))
-        
-        # First row: Input image
-        plt.subplot(4, 1, 1)
-        plt.imshow(cv2.cvtColor(orig_img.astype(np.uint8), cv2.COLOR_BGR2RGB))
-        plt.title('Input Image')
-        plt.axis('off')
-        
-        # Second row: Ground truth depth
-        plt.subplot(4, 1, 2)
-        plt.imshow(gt_rgb)
-        plt.title(f'Ground Truth Depth (Near=Red, Far=Blue)\n{gt_range_text}')
-        
-        # Add depth scale markers for GT (now confirmed as depth values)
-        if gt_valid_depths:
-            h, w = gt_depth.shape
-            x_center = w // 2
-            y_positions = [h // 6, h // 2, 5 * h // 6]  # top, middle, bottom
-            
-            for y_pos in y_positions:
-                if gt_valid[y_pos, x_center]:
-                    depth_val = gt_depth[y_pos, x_center]
-                    plt.annotate(f'{depth_val:.4f}m', 
-                               xy=(x_center, y_pos), 
-                               xytext=(x_center + w//8, y_pos),
-                               fontsize=8, color='white', weight='bold',
-                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8),
-                               arrowprops=dict(arrowstyle='->', color='white', lw=1))
-        
-        plt.axis('off')
-    
-    # Second row: Depth predictions and error maps
-    if has_enhancement:
-        # Show both predictions for comparison
-        plt.subplot(2, 3, 4)
-        plt.imshow(orig_pred_rgb)
-        plt.title(f'Original Image {pred_title_suffix}\n{pred_range_text}')
-        
-        # Add depth scale markers for predictions
-        if pred_valid_depths:
-            h, w = orig_pred_depth.shape
-            x_center = w // 2
-            y_positions = [h // 6, h // 2, 5 * h // 6]
-            
-            for y_pos in y_positions:
-                if orig_pred_valid[y_pos, x_center]:
-                    pred_val = orig_pred_depth[y_pos, x_center]
-                    # Mask already filters reasonable range, no additional check needed
-                    full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, orig_pred_depth, orig_pred_valid, gt_valid)
-                    
-                    plt.annotate(full_label, 
-                               xy=(x_center, y_pos), 
-                               xytext=(x_center + w//10, y_pos),
-                               fontsize=8, color='white', weight='bold',
-                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7),
-                               arrowprops=dict(arrowstyle='->', color='white', lw=1))
-        
-        plt.axis('off')
-        
-        plt.subplot(2, 3, 5)
-        plt.imshow(enhanced_pred_rgb)
-        plt.title(f'Enhanced Image {pred_title_suffix}\n{pred_range_text}')
-        
-        # Add depth scale markers for enhanced predictions
-        if pred_valid_depths:
-            h, w = enhanced_pred_depth.shape
-            x_center = w // 2
-            y_positions = [h // 6, h // 2, 5 * h // 6]
-            
-            for y_pos in y_positions:
-                if enhanced_pred_valid[y_pos, x_center]:
-                    pred_val = enhanced_pred_depth[y_pos, x_center]
-                    # Mask already filters reasonable range, no additional check needed
-                    full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, enhanced_pred_depth, enhanced_pred_valid, gt_valid)
-                    
-                    plt.annotate(full_label, 
-                               xy=(x_center, y_pos), 
-                               xytext=(x_center + w//10, y_pos),
-                               fontsize=8, color='white', weight='bold',
-                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7),
-                               arrowprops=dict(arrowstyle='->', color='white', lw=1))
-        
-        plt.axis('off')
-        
-        # Error comparison for enhancement
-        plt.subplot(2, 3, 6)
-        _plot_error_comparison(gt_depth, orig_pred_depth, enhanced_pred_depth, gt_valid, orig_pred_valid, enhanced_pred_valid, "Enhanced")
-    else:
-        # 4x1 layout: Third row - Predicted depth
-        plt.subplot(4, 1, 3)
-        plt.imshow(orig_pred_rgb)
-        plt.title(f'Predicted {pred_title_suffix}\n{pred_range_text}')
-        
-        # Add depth scale markers for prediction
-        if pred_valid_depths:
-            h, w = orig_pred_depth.shape
-            x_center = w // 2
-            y_positions = [h // 6, h // 2, 5 * h // 6]
-            
-            for y_pos in y_positions:
-                if orig_pred_valid[y_pos, x_center]:
-                    pred_val = orig_pred_depth[y_pos, x_center]
-                    # Mask already filters reasonable range, no additional check needed
-                    full_label = format_depth_label(pred_val, model_characteristics, conversion_info, gt_valid_depths, gt_depth, orig_pred_depth, orig_pred_valid, gt_valid)
-                    
-                    plt.annotate(full_label, 
-                               xy=(x_center, y_pos), 
-                               xytext=(x_center + w//10, y_pos),
-                               fontsize=8, color='white', weight='bold',
-                               bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7),
-                               arrowprops=dict(arrowstyle='->', color='white', lw=1))
-        
-        plt.axis('off')
-        
-        # 4x1 layout: Fourth row - Error analysis
-        plt.subplot(4, 1, 4)
-        _plot_single_error_analysis(gt_depth, orig_pred_depth, gt_valid, orig_pred_valid)
-    
+    orig_pred_valid = create_metric_valid_mask(orig_pred_depth)
+    enhanced_pred_valid = create_metric_valid_mask(enhanced_pred_depth)
+    # 布局
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.flatten()
+    axes[0].imshow(cv2.cvtColor(orig_img.astype(np.uint8), cv2.COLOR_BGR2RGB))
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+    axes[1].imshow(cv2.cvtColor(enhanced_img.astype(np.uint8), cv2.COLOR_BGR2RGB))
+    axes[1].set_title('Enhanced Image')
+    axes[1].axis('off')
+    axes[2].imshow(gt_viz)
+    axes[2].set_title(f'Ground Truth Depth (Near=Red, Far=Blue)\n{range_texts["gt"]}')
+    axes[2].axis('off')
+    add_depth_markers(axes[2], gt_depth, gt_valid, None, None, None, None, None)
+    axes[3].imshow(pred_vizs['Original'])
+    axes[3].set_title(f'Original Depth Prediction\n{range_texts["Original"]}')
+    axes[3].axis('off')
+    add_depth_markers(axes[3], aligned_depths['Original'], orig_pred_valid, model_characteristics, conversion_info, [gt_depth[gt_valid]], gt_depth, gt_valid)
+    axes[4].imshow(pred_vizs['Enhanced'])
+    axes[4].set_title(f'Enhanced Depth Prediction\n{range_texts["Enhanced"]}')
+    axes[4].axis('off')
+    add_depth_markers(axes[4], aligned_depths['Enhanced'], enhanced_pred_valid, model_characteristics, conversion_info, [gt_depth[gt_valid]], gt_depth, gt_valid)
+    plt.sca(axes[5])
+    _plot_error_comparison(gt_depth, orig_pred_depth, enhanced_pred_depth, gt_valid, orig_pred_valid, enhanced_pred_valid, "Enhanced")
     plt.tight_layout()
-    
-    # Save with appropriate suffix based on enhancement
-    if has_enhancement:
-        plt.savefig(os.path.join(output_dir, f"{file_prefix}_comparison.png"), dpi=300, bbox_inches='tight')
-    else:
-        plt.savefig(os.path.join(output_dir, f"{file_prefix}_analysis.png"), dpi=300, bbox_inches='tight')
-    
+    plt.savefig(os.path.join(output_dir, f"{file_prefix}_comparison.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 def validate_dataset(args):
