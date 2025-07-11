@@ -44,8 +44,6 @@ from depth_utils import (
     align_depth_scale, 
     compute_depth_metrics, 
     format_depth_label, 
-    prepare_depth_visualization,
-    create_depth_range_text,
     extract_depth_maps,
     create_robust_valid_mask,
     create_simple_valid_mask

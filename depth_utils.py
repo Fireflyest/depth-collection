@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from typing import Optional, List, Tuple, Union
 from scipy.stats import pearsonr, spearmanr
+import matplotlib.pyplot as plt
 
 
 def align_depth_scale(pred: np.ndarray, gt: np.ndarray, method: str = 'median') -> Tuple[float, np.ndarray]:
@@ -234,97 +235,6 @@ def format_depth_label(pred_val: float,
     # Combine raw and meter labels
     return raw_label + meter_label
 
-
-def prepare_depth_visualization(depth_map: np.ndarray, 
-                               percentile_range: Tuple[float, float] = (2, 98)) -> np.ndarray:
-    """
-    Prepare depth map for visualization with proper normalization
-    
-    Args:
-        depth_map: Input depth map
-        percentile_range: Percentile range for normalization (min, max)
-        
-    Returns:
-        Normalized and inverted depth map for visualization
-    """
-    # Create robust mask for valid pixels that filters out extreme values
-    valid_mask = create_robust_valid_mask(depth_map)
-    
-    if not np.any(valid_mask):
-        return np.zeros_like(depth_map)
-    
-    # Normalize depth for visualization
-    valid_depths = depth_map[valid_mask]
-    min_depth = np.percentile(valid_depths, percentile_range[0])
-    max_depth = np.percentile(valid_depths, percentile_range[1])
-    
-    # Normalize to [0, 1] range
-    normalized = np.zeros_like(depth_map)
-    normalized[valid_mask] = np.clip(
-        (depth_map[valid_mask] - min_depth) / (max_depth - min_depth + 1e-8), 0, 1
-    )
-    
-    # Invert for depth visualization (near=red, far=blue in jet colormap)
-    return 1.0 - normalized
-
-
-def create_depth_range_text(depth_map: np.ndarray, 
-                           model_characteristics, 
-                           conversion_info: Optional[dict] = None,
-                           gt_depth: Optional[np.ndarray] = None,
-                           percentile_range: Tuple[float, float] = (5, 95)) -> str:
-    """
-    Create range text for depth visualization
-    
-    Args:
-        depth_map: Depth map
-        model_characteristics: Model output characteristics
-        conversion_info: Unit conversion information
-        gt_depth: Ground truth depth for scale estimation (for non-metric models)
-        percentile_range: Percentile range for min/max calculation
-        
-    Returns:
-        Formatted range text
-    """
-    valid_mask = create_robust_valid_mask(depth_map)
-    
-    if not np.any(valid_mask):
-        return "N/A"
-    
-    min_depth = np.percentile(depth_map[valid_mask], percentile_range[0])
-    max_depth = np.percentile(depth_map[valid_mask], percentile_range[1])
-    
-    if conversion_info and conversion_info.get('applied', False):
-        # Show original and converted range
-        min_orig = model_characteristics.get_original_value_from_converted(min_depth)
-        max_orig = model_characteristics.get_original_value_from_converted(max_depth)
-        return f'{min_orig:.3f}-{max_orig:.3f}({model_characteristics.output_unit[:4]})\n→{min_depth:.3f}-{max_depth:.3f}m'
-    elif model_characteristics.is_metric:
-        return f'{min_depth:.3f}-{max_depth:.3f}m'
-    else:
-        # Non-metric: show relative values with approximate metric conversion
-        if model_characteristics.output_unit == 'affine-invariant':
-            range_text = f'{min_depth:.3f}-{max_depth:.3f}(aff-inv)'
-        else:
-            range_text = f'{min_depth:.3f}-{max_depth:.3f}(rel)'
-        
-        # Try to estimate metric range using GT scale
-        if gt_depth is not None:
-            gt_valid = ~np.isnan(gt_depth) & ~np.isinf(gt_depth) & (gt_depth > 0)
-            if np.any(gt_valid):
-                gt_sample = gt_depth[gt_valid]
-                pred_sample = depth_map[valid_mask & gt_valid]
-                if len(pred_sample) > 0 and len(gt_sample) > 0:
-                    scale = np.median(gt_sample) / np.median(pred_sample)
-                    min_metric = min_depth * scale
-                    max_metric = max_depth * scale
-                    range_text += f'\n≈{min_metric:.3f}-{max_metric:.3f}m'
-                    return range_text
-        
-        range_text += '\n≈?-?m'
-        return range_text
-
-
 def extract_depth_maps(results):
     """
     Extract depth maps from VGGT multi-image inference results.
@@ -398,3 +308,164 @@ def create_simple_valid_mask(depth_map: np.ndarray) -> np.ndarray:
     valid_mask = (~np.isnan(depth_map)) & (~np.isinf(depth_map)) & (depth_map > 0)
     
     return valid_mask
+
+def add_depth_markers(ax, depth_map, valid_mask, model_chars, conversion_info, 
+                      gt_valid_depths, gt_depth, gt_valid):
+    """Add depth value markers at specific points"""
+    if not np.any(valid_mask):
+        return
+        
+    h, w = depth_map.shape
+    x_center = w // 2
+    y_positions = [h // 6, h // 2, 5 * h // 6]  # top, middle, bottom
+    
+    for y_pos in y_positions:
+        if valid_mask[y_pos, x_center]:
+            depth_val = depth_map[y_pos, x_center]
+            
+            if model_chars is not None:
+                # For predictions, use formatted label
+                pred_valid = valid_mask
+                full_label = format_depth_label(
+                    depth_val, model_chars, conversion_info, 
+                    gt_valid_depths, gt_depth, depth_map, pred_valid, gt_valid
+                )
+            else:
+                # For GT, simple meter label
+                full_label = f'{depth_val:.3f}m'
+            
+            ax.annotate(full_label, 
+                        xy=(x_center, y_pos), 
+                        xytext=(x_center + w//8, y_pos),
+                        fontsize=6, color='white', weight='bold',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.8),
+                        arrowprops=dict(arrowstyle='->', color='white', lw=1))
+
+
+def prepare_depths_for_visualization(gt_depth, samples, predictions, model_names, current_row):
+    """Prepare depth visualizations with individual normalization for each depth map"""
+    # Prepare GT visualization (individual normalization) - use simple mask for GT
+    gt_viz = prepare_individual_depth_visualization(gt_depth, use_robust_mask=False)
+    
+    # Create range text for GT
+    gt_valid = create_simple_valid_mask(gt_depth)
+    if np.any(gt_valid):
+        gt_min = np.percentile(gt_depth[gt_valid], 2)
+        gt_max = np.percentile(gt_depth[gt_valid], 98)
+        range_texts = {'gt': f"{gt_min:.3f}-{gt_max:.3f}m"}
+    else:
+        range_texts = {'gt': "N/A"}
+    
+    # Prepare prediction visualizations (individual normalization for each)
+    pred_vizs = {}
+    aligned_depths = {}  # Store aligned depths for marker annotation
+    for model_name in model_names:
+        if (current_row < len(predictions[model_name]) and 
+            predictions[model_name][current_row] is not None):
+            pred_data = predictions[model_name][current_row]
+            display_depth = pred_data['display_depth']
+            model_chars = pred_data['model_characteristics']
+            conversion_info = pred_data['conversion_info']
+            
+            # For affine-invariant depth, convert to metric using GT scale alignment
+            if (model_chars.output_unit == 'affine-invariant' and 
+                not conversion_info.get('applied', False)):
+                # Scale align with GT to get metric depth for visualization
+                gt_sample_data = samples[current_row]
+                gt_depth_sample = gt_sample_data['gt_depth']
+                gt_valid_sample = create_simple_valid_mask(gt_depth_sample)
+                display_valid_sample = create_simple_valid_mask(display_depth)
+                
+                if np.any(gt_valid_sample) and np.any(display_valid_sample):
+                    # Find overlapping valid pixels
+                    common_valid = gt_valid_sample & display_valid_sample
+                    if np.any(common_valid):
+                        # Use median ratio for scale alignment
+                        gt_vals = gt_depth_sample[common_valid]
+                        pred_vals = display_depth[common_valid]
+                        if len(gt_vals) > 0 and len(pred_vals) > 0:
+                            scale = np.median(gt_vals) / np.median(pred_vals)
+                            display_depth = display_depth * scale
+            
+            # Individual normalization for this prediction - use robust mask for predictions
+            pred_viz = prepare_individual_depth_visualization(display_depth, use_robust_mask=True)
+            pred_vizs[model_name] = pred_viz
+            
+            # Create range text with proper unit handling
+            pred_valid = create_robust_valid_mask(display_depth)
+            if np.any(pred_valid):
+                pred_min = np.percentile(display_depth[pred_valid], 2)
+                pred_max = np.percentile(display_depth[pred_valid], 98)
+                
+                if conversion_info and conversion_info.get('applied', False):
+                    # Show original and converted range
+                    min_orig = model_chars.get_original_value_from_converted(pred_min)
+                    max_orig = model_chars.get_original_value_from_converted(pred_max)
+                    range_texts[model_name] = f'{min_orig:.3f}-{max_orig:.3f}({model_chars.output_unit[:4]})\n→{pred_min:.3f}-{pred_max:.3f}m'
+                elif model_chars.is_metric:
+                    range_texts[model_name] = f'{pred_min:.3f}-{pred_max:.3f}m'
+                else:
+                    # Non-metric: show relative values
+                    if model_chars.output_unit == 'affine-invariant':
+                        range_texts[model_name] = f'{pred_min:.3f}-{pred_max:.3f}(aff-inv)'
+                    else:
+                        range_texts[model_name] = f'{pred_min:.3f}-{pred_max:.3f}(rel)'
+                    
+                    # Add approximate metric conversion using GT scale
+                    if np.any(gt_valid):
+                        gt_sample = gt_depth[gt_valid]
+                        pred_sample = display_depth[pred_valid & gt_valid]
+                        if len(pred_sample) > 0 and len(gt_sample) > 0:
+                            scale = np.median(gt_sample) / np.median(pred_sample)
+                            min_metric = pred_min * scale
+                            max_metric = pred_max * scale
+                            range_texts[model_name] += f'\n≈{min_metric:.3f}-{max_metric:.3f}m'
+                        else:
+                            range_texts[model_name] += '\n≈?-?m'
+                    else:
+                        range_texts[model_name] += '\n≈?-?m'
+            else:
+                range_texts[model_name] = "N/A"
+            
+            # Store aligned depth for marker annotation
+            aligned_depths[model_name] = display_depth.copy()
+        else:
+            range_texts[model_name] = "N/A"
+            aligned_depths[model_name] = None
+    
+    return gt_viz, pred_vizs, range_texts, aligned_depths
+
+def prepare_individual_depth_visualization(depth_map: np.ndarray, use_robust_mask: bool = True) -> np.ndarray:
+    """Prepare individual depth map for visualization with independent normalization"""
+    # Create mask for valid pixels - use robust for predictions, simple for GT
+    if use_robust_mask:
+        valid_mask = create_robust_valid_mask(depth_map)
+    else:
+        valid_mask = create_simple_valid_mask(depth_map)
+    
+    if not np.any(valid_mask):
+        # Return black RGB image for no valid data
+        return np.zeros((*depth_map.shape, 3), dtype=np.float32)
+    
+    # Normalize depth for visualization using its own range
+    valid_depths = depth_map[valid_mask]
+    min_depth = np.percentile(valid_depths, 2)
+    max_depth = np.percentile(valid_depths, 98)
+    
+    # Normalize to [0, 1] range
+    normalized = np.zeros_like(depth_map)
+    normalized[valid_mask] = np.clip(
+        (depth_map[valid_mask] - min_depth) / (max_depth - min_depth + 1e-8), 0, 1
+    )
+    
+    # Invert for depth visualization (near=red, far=blue in jet colormap)
+    normalized_inverted = 1.0 - normalized
+    
+    # Apply jet colormap and convert to RGB
+    cm_jet = plt.colormaps['jet']
+    colored = np.zeros((*depth_map.shape, 4), dtype=np.float32)
+    colored[valid_mask] = cm_jet(normalized_inverted[valid_mask])
+    # Invalid pixels remain black (RGB = [0,0,0])
+    rgb_image = colored[:, :, :3]  # Extract RGB channels
+    
+    return rgb_image
