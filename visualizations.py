@@ -87,19 +87,14 @@ class MultiModelComparison:
         print("Initializing models...")
         
         for model_name, config in self.model_configs.items():
-            try:
-                print(f"Loading {model_name}...")
-                model = create_model(
-                    model_type=config['type'],
-                    device=self.device,
-                    **{k: v for k, v in config.items() if k != 'type'}
-                )
-                self.models[model_name] = model
-                print(f"✅ {model_name} loaded successfully")
-            except Exception as e:
-                print(f"❌ Failed to load {model_name}: {e}")
-                # Don't include failed models in the comparison
-                continue
+            print(f"Loading {model_name}...")
+            model = create_model(
+                model_type=config['type'],
+                device=self.device,
+                **{k: v for k, v in config.items() if k != 'type'}
+            )
+            self.models[model_name] = model
+            print(f"{model_name} loaded successfully")
     
     def _select_samples(self) -> List[int]:
         """Select sample indices for comparison"""
@@ -120,55 +115,44 @@ class MultiModelComparison:
         print(f"Running inference on {len(self.sample_indices)} samples...")
         
         for idx in tqdm(self.sample_indices, desc="Processing samples"):
-            try:
-                # Load sample
-                sample = self.dataset[idx]
-                original_image = sample['original_image']
-                gt_depth = sample['depth']
-                basename = sample['basename']
-                
-                if original_image is None or gt_depth is None:
-                    print(f"Invalid sample at index {idx}")
-                    continue
-                
-                # Store sample data
-                sample_data = {
-                    'index': idx,
-                    'basename': basename,
-                    'original_image': original_image,
-                    'gt_depth': gt_depth
-                }
-                results['samples'].append(sample_data)
-                
-                # Run inference for each model
-                for model_name, model in self.models.items():
-                    try:
-                        # Run inference
-                        pred_depth = model.predict(original_image, input_size=518)
-                        
-                        # Post-process prediction
-                        processed_depth, display_depth, conversion_info = model.postprocess_prediction(
-                            pred_depth, gt_depth.shape
-                        )
-                        
-                        # Store prediction
-                        pred_data = {
-                            'raw_prediction': pred_depth,
-                            'processed_depth': processed_depth,
-                            'display_depth': display_depth,
-                            'conversion_info': conversion_info,
-                            'model_characteristics': model.output_characteristics
-                        }
-                        results['predictions'][model_name].append(pred_data)
-                        
-                    except Exception as e:
-                        print(f"Error running {model_name} on sample {idx}: {e}")
-                        # Add empty prediction to maintain alignment
-                        results['predictions'][model_name].append(None)
-                        
-            except Exception as e:
-                print(f"Error processing sample {idx}: {e}")
+            # Load sample
+            sample = self.dataset[idx]
+            original_image = sample['original_image']
+            gt_depth = sample['depth']
+            basename = sample['basename']
+            
+            if original_image is None or gt_depth is None:
+                print(f"Invalid sample at index {idx}")
                 continue
+            
+            # Store sample data
+            sample_data = {
+                'index': idx,
+                'basename': basename,
+                'original_image': original_image,
+                'gt_depth': gt_depth
+            }
+            results['samples'].append(sample_data)
+            
+            # Run inference for each model
+            for model_name, model in self.models.items():
+                # Run inference
+                pred_depth = model.predict(original_image, input_size=518)
+                
+                # Post-process prediction
+                processed_depth, display_depth, conversion_info = model.postprocess_prediction(
+                    pred_depth, gt_depth.shape
+                )
+                
+                # Store prediction
+                pred_data = {
+                    'raw_prediction': pred_depth,
+                    'processed_depth': processed_depth,
+                    'display_depth': display_depth,
+                    'conversion_info': conversion_info,
+                    'model_characteristics': model.output_characteristics
+                }
+                results['predictions'][model_name].append(pred_data)
         
         return results
     
@@ -598,36 +582,33 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    try:
-        # Initialize comparison
-        print("🚀 Starting Multi-Model Depth Estimation Comparison")
-        print("="*60)
-        
-        comparison = MultiModelComparison(
-            data_root=args.data_root,
-            num_samples=args.num_samples,
-            random_seed=args.random_seed
-        )
-        
-        # Run inference
-        print("\n📊 Running inference on all models...")
-        results = comparison.run_inference()
-        
-        # Create visualization
-        print("\n🎨 Creating comparison visualization...")
-        output_path = os.path.join(args.output_dir, "model_comparison.png")
-        comparison.create_comparison_visualization(results, output_path, args.max_rows_final)
-        
-        # Compute and print metrics
-        print("\n📈 Computing evaluation metrics...")
-        metrics = comparison.compute_and_print_metrics(results)
-        
-        print(f"\n✅ Comparison completed successfully!")
-        print(f"📁 Results saved to: {args.output_dir}")
-        
-    except Exception as e:
-        print(f"❌ Error during comparison: {e}")
-        raise
+    # Initialize comparison
+    print("🚀 Starting Multi-Model Depth Estimation Comparison")
+    print("="*60)
+    
+    comparison = MultiModelComparison(
+        data_root=args.data_root,
+        num_samples=args.num_samples,
+        random_seed=args.random_seed
+    )
+    
+    # Run inference
+    print("\n📊 Running inference on all models...")
+    results = comparison.run_inference()
+    
+    # Create visualization
+    print("\n🎨 Creating comparison visualization...")
+    output_path = os.path.join(args.output_dir, "model_comparison.png")
+    comparison.create_comparison_visualization(results, output_path, args.max_rows_final)
+    
+    # Compute and print metrics
+    print("\n📈 Computing evaluation metrics...")
+    metrics = comparison.compute_and_print_metrics(results)
+    
+    print(f"\n✅ Comparison completed successfully!")
+    print(f"📁 Results saved to: {args.output_dir}")
+    
+
 
 if __name__ == '__main__':
     main()
