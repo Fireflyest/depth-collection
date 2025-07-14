@@ -214,45 +214,21 @@ class FLSeaDataset(BaseDepthDataset):
 class StandardDepthDataset(BaseDepthDataset):
     """
     Standard depth dataset with only original images and depth maps.
-    
-    Expected structures:
-    1. Hierarchical structure:
-        data_root/
-            images/         # Original images (*.jpg, *.png, *.tiff)
-            depth/          # Depth maps (*.tif, *.npy, same basename as images)
-    
-    2. Alternative hierarchical structure:
+    Alternative hierarchical structure:
         data_root/
             imgs/           # Original images (any format)
             depth/          # Depth maps (various naming patterns)
-    
-    3. Flat structure:
-        data_root/
-            *.jpg, *.png    # Images
-            *_depth.tif     # Corresponding depth maps
     """
     
-    def _initialize_dataset(self):
+    def _initialize_dataset(self, img_dirname: str = 'imgs', depth_dirname: str = 'depth'):
         """Initialize standard dataset by finding matching images and depth maps."""
-        # Try different hierarchical structures
-        possible_img_dirs = ['images', 'imgs', 'rgb', 'color']
-        possible_depth_dirs = ['depth', 'depths', 'gt', 'groundtruth']
-        found_hierarchical = False
-        for img_dirname in possible_img_dirs:
-            img_dir = os.path.join(self.data_root, img_dirname)
-            if os.path.exists(img_dir):
-                for depth_dirname in possible_depth_dirs:
-                    depth_dir = os.path.join(self.data_root, depth_dirname)
-                    if os.path.exists(depth_dir):
-                        try:
-                            self._init_hierarchical_structure(img_dir, depth_dir)
-                            found_hierarchical = True
-                            if len(self.valid_samples) > 0:
-                                return
-                        except ValueError as e:
-                            print(f"[StandardDepthDataset] Hierarchical structure error: {e}")
-        # If no hierarchical structure worked, try flat structure
-        self._init_flat_structure()
+        img_dir = os.path.join(self.data_root, img_dirname)
+        depth_dir = os.path.join(self.data_root, depth_dirname)
+        if os.path.exists(img_dir) and os.path.exists(depth_dir):
+            self._init_hierarchical_structure(img_dir, depth_dir)
+        if len(self.valid_samples) == 0:
+            print(f"[StandardDepthDataset] No valid samples found in hierarchical structure ({img_dir}, {depth_dir}).")
+
 
     def _init_hierarchical_structure(self, img_dir: str, depth_dir: str):
         """Initialize dataset with hierarchical directory structure."""
@@ -271,17 +247,8 @@ class StandardDepthDataset(BaseDepthDataset):
             # Try different depth file patterns (more comprehensive)
             depth_patterns = [
                 f"{basename}.tif",
-                f"{basename}.tiff",  # <-- add tiff support
-                f"{basename}_depth.tif", 
-                f"{basename}_depth.tiff",  # <-- add tiff support
-                f"{basename}.npy",
-                f"{basename}_depth.npy",
-                f"{basename}_gt.tif",
-                f"{basename}_groundtruth.tif",
                 f"{basename}_SeaErra_abs_depth.tif",
-                f"{basename}_abs_depth.tif",
-                f"{basename}.png",
-                f"{basename}_depth.png"
+                f"{basename}.tiff",
             ]
             depth_path = None
             for pattern in depth_patterns:
@@ -291,47 +258,6 @@ class StandardDepthDataset(BaseDepthDataset):
                     break
             if depth_path is None:
                 continue  # Skip samples without depth maps
-            self.valid_samples.append({
-                'original_image_path': img_path,
-                'depth_path': depth_path,
-                'basename': basename
-            })
-    
-    def _init_flat_structure(self):
-        """Initialize dataset with flat directory structure."""
-        # Look for images in root directory
-        image_patterns = ['*.jpg', '*.jpeg', '*.png', '*.tiff', '*.tif']
-        img_files = []
-        
-        for pattern in image_patterns:
-            img_files.extend(glob.glob(os.path.join(self.data_root, pattern)))
-        
-        img_files = sorted(img_files)
-        if not img_files:
-            raise ValueError(f"No images found in {self.data_root}")
-        
-        # Find matching depth maps in same directory
-        for img_path in img_files:
-            basename = os.path.splitext(os.path.basename(img_path))[0]
-            
-            # Try different depth file patterns
-            depth_patterns = [
-                f"{basename}_depth.tif",
-                f"{basename}_depth.npy",
-                f"{basename}.tif",  # Only if not the image itself
-                f"{basename}.npy"
-            ]
-            
-            depth_path = None
-            for pattern in depth_patterns:
-                candidate_path = os.path.join(self.data_root, pattern)
-                if os.path.exists(candidate_path) and candidate_path != img_path:
-                    depth_path = candidate_path
-                    break
-            
-            if depth_path is None:
-                continue  # Skip samples without depth maps
-            
             self.valid_samples.append({
                 'original_image_path': img_path,
                 'depth_path': depth_path,

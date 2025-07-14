@@ -220,7 +220,7 @@ class ModelWrapper:
             )
         
         print(f"Loading DepthAnything v2 model from {model_path}")
-        self.model.load_state_dict(torch.load(model_path, map_location='cpu'))
+        self.model.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
         self.model = self.model.to(self.device).eval()
         
     def _init_zoedepth(self, zoedepth_type='N', checkpoint_dir='checkpoints'):
@@ -654,3 +654,42 @@ def get_model_name(model_type: str, **kwargs) -> str:
         return "Metric3D"
     else:
         return model_type
+
+def print_models_structures():
+    """
+    Print the structures of all available models
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model_infos = get_available_models()
+    out_dir = './out'
+    os.makedirs(out_dir, exist_ok=True)
+    for model_type, info in model_infos.items():
+        print(f'\n=== {model_type} ===')
+        # 构造参数
+        kwargs = {}
+        for param in info.get('required_params', []):
+            # 默认参数
+            if param == 'encoder':
+                kwargs['encoder'] = info['variants'][0]
+            elif param == 'zoedepth_type':
+                kwargs['zoedepth_type'] = info['variants'][0]
+        # 可选参数
+        for param in info.get('optional_params', []):
+            if param == 'metric':
+                kwargs['metric'] = False
+            if param == 'multi_image_mode':
+                kwargs['multi_image_mode'] = False
+            if param == 'checkpoint_dir':
+                kwargs['checkpoint_dir'] = 'checkpoints'
+        try:
+            model = create_model(model_type, device, **kwargs)
+            structure_str = str(model.model)
+            out_path = os.path.join(out_dir, f'{model_type}.txt')
+            with open(out_path, 'w') as f:
+                f.write(structure_str)
+            print(f'Saved structure to {out_path}')
+        except Exception as e:
+            print(f'Error creating {model_type}: {e}')
+
+if __name__ == '__main__':
+    print_models_structures()

@@ -31,22 +31,21 @@ from depth_utils import compute_depth_metrics, add_depth_markers, prepare_depths
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
 
+
 class MultiModelComparison:
     """Class to handle multi-model depth estimation comparison"""
     
-    def __init__(self, data_root: str, num_samples: int = 5, random_seed: int = 42):
+    def __init__(self, data_root: str, num_samples: int = 5, random_seed: int = 42, device: str = "cuda"):
         self.data_root = data_root
         self.num_samples = num_samples
         self.random_seed = random_seed
-        
+        self.device = torch.device(device) if torch.cuda.is_available() else torch.device("cpu")
+        print(f"Using device: {self.device}")
+
         # Set random seed for reproducible results
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
         random.seed(random_seed)
-        
-        # Initialize device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
         
         # Model configurations
         self.model_configs = {
@@ -156,7 +155,7 @@ class MultiModelComparison:
         
         return results
     
-    def create_comparison_visualization(self, results: Dict, output_path: str = "model_comparison.png", 
+    def create_comparison_visualization(self, results: Dict, output_path: str = "model_comparison.png", depth_markers: bool = True,
                                       max_rows_in_final: Optional[int] = None):
         """Create comprehensive comparison visualization with 5 columns layout"""
         samples = results['samples']
@@ -232,7 +231,8 @@ class MultiModelComparison:
                             verticalalignment='top')
                     
                     # Add depth scale markers for GT
-                    add_depth_markers(ax, gt_valid_mask, gt_depth, None, True)
+                    if depth_markers:
+                        add_depth_markers(ax, gt_valid_mask, gt_depth, None, True)
                 
                 else:  # Model predictions
                     model_idx = col - 2
@@ -251,8 +251,10 @@ class MultiModelComparison:
                             bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
                             verticalalignment='top')
 
-                        add_depth_markers(ax, aligned_valid_masks[model_name],
-                                          display_depths[model_name], aligned_depths[model_name], model_chars.is_metric)
+                        # Add depth scale markers for model predictions
+                        if depth_markers:
+                            add_depth_markers(ax, aligned_valid_masks[model_name],
+                                            display_depths[model_name], aligned_depths[model_name], model_chars.is_metric)
 
                     else:
                         # No prediction available
@@ -385,7 +387,9 @@ def main():
                        help='Output directory for comparison results')
     parser.add_argument('--random-seed', type=int, default=42,
                        help='Random seed for reproducible sample selection')
-    
+    parser.add_argument('--depth_markers', action='store_true',
+                       help='Whether to include depth markers in the visualization')
+
     args = parser.parse_args()
     
     # Create output directory
@@ -408,8 +412,8 @@ def main():
     # Create visualization
     print("\n🎨 Creating comparison visualization...")
     output_path = os.path.join(args.output_dir, "model_comparison.png")
-    comparison.create_comparison_visualization(results, output_path, args.max_rows_final)
-    
+    comparison.create_comparison_visualization(results, output_path, args.depth_markers, args.max_rows_final)
+
     # Compute and print metrics
     print("\n📈 Computing evaluation metrics...")
     metrics = comparison.compute_and_print_metrics(results)
